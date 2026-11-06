@@ -21,12 +21,13 @@ function harness() {
   const context=vm.createContext({Page:value=>{definition=value;},wx,require:name=>name.endsWith('/protocol')?p:{Connection},
     setTimeout:(fn)=>{const id=++nextId;timers.set(id,fn);return id;},clearTimeout:id=>timers.delete(id),console});
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../pages/index/index.js'),'utf8'),context);
-  const page=Object.assign({},definition,{data:JSON.parse(JSON.stringify(definition.data)),setData(patch){
+  const page=Object.assign({},definition,{data:JSON.parse(JSON.stringify(definition.data)),setData(patch,callback){
     Object.entries(patch).forEach(([key,value])=>{
       const parts=key.replace(/\[(\d+)\]/g,'.$1').split('.');
       let item=this.data;for(let n=0;n<parts.length-1;n++)item=item[parts[n]];
       item[parts[parts.length-1]]=value;
     });
+    if(callback)callback();
   }});
   page.onLoad();page.onShow();
   page.setData({address:'ws://192.168.1.100:8765',deviceId:'s3',token:'local-pairing-token'});page.connect();
@@ -66,7 +67,7 @@ test('sentence updates and emotion do not add duplicate visible text', () => {
   h.receive(base);h.flush();h.receive(Object.assign({},base,{revision:2,text:'今天很好。',final:true}));h.flush();
   h.receive({type:'emotion',device_id:'s3',recording_id:'r',segment_id:0,label:'happy',status:'ready'});h.flush();
   assert.equal(h.page.data.groups.length,1);assert.equal(h.page.data.groups[0].segments.length,1);
-  assert.equal(h.page.data.groups[0].text,'今天很好。');assert.equal(h.page.data.groups[0].segments[0].emotionText,'开心');
+  assert.equal(h.page.data.groups[0].segments[0].text,'今天很好。');assert.equal(h.page.data.groups[0].segments[0].emotionText,'开心');
 });
 test('repeated handshake failure prompts connection checks without claiming an authentication cause', () => {
   const h=harness();h.page.connection.handshakeFailures=3;

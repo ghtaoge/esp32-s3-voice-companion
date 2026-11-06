@@ -37,7 +37,7 @@ JSON 字段 `type` 标识消息。所有控制消息与二进制音频按同一 
 - `status`: `state` 为 `offline`/`idle`/`recording`/`processing`/`error`，带 `device_id, recording_id`（无则 null）、可选 `message`。
 - `transcript`: `device_id, recording_id, segment_id`（整数，从0递增）, `revision`（整数）, `text, final`（boolean）, `start_ms, end_ms`。同录音同分句以 revision 较新者覆盖，不能追加两遍结果。`final:true` 是分句完成，不代表整次录音完成。
 - `emotion`: `device_id, recording_id, segment_id, label, event`；可有 `status`（`ready`/`skipped`/`error`）。label 为 SenseVoice 原始标签映射：neutral/happy/sad/angry/fearful/disgusted/surprised/unknown。没有识别标签时必须 unknown，不能按关键词伪造情绪；不提供模型没有输出的置信度。
-- `recording_done`: `recording_id, segments, audio_ms, final_latency_ms`，松键之后所有分句最终结果已发出；情绪结果可稍后单独到达。
+- `recording_done`: `recording_id, segments, audio_ms, final_latency_ms`，松键之后所有分句最终结果已发出；情绪结果可稍后单独到达。诊断字段：`worker_calls` 为本次推理调度次数，`audio_queue_peak_ms` 为排队音频峰值，`first_partial_ms` 为服务端会话创建到首个临时字幕的时间（没有临时字幕时为null）。
 - `settings_set`: 只发设备，`request_id, settings`。
 - `settings_applied`: 两端，`request_id, settings`，仅由设备 ACK 触发。
 - `settings_pending`: 只发请求客户端，尚待设备 ACK。
@@ -49,3 +49,5 @@ JSON 字段 `type` 标识消息。所有控制消息与二进制音频按同一 
 启动先等按钮释放；按下与松开消抖约25ms。按下→缓存采音+请求 ready→流式上传；松开→停止采音→排空尾包→stop→等待 recording_done。busy/断网/过载要显示明确错误并要求先释放再按，不把旧音频续进下一次录音。最长单次录音默认60秒，可配置。
 
 OLED 的音量与嘴形直接使用本机 PCM RMS，不等待服务端。I²S 采集、网络、显示各自运行，显示最多20 FPS。电脑发送临时字幕但不用固定频率发送整份历史。
+
+20ms是传输粒度，电脑按既有100ms VAD粒度聚合后提交推理线程，最后不足100ms的尾包随stop立即提交。VAD回报可以回溯端点、单次含多个边界，网关按绝对样本位置顺序处理并回填句首。整次上限60秒，不以任意12秒重置识别上下文。

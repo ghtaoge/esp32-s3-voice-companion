@@ -53,7 +53,7 @@ test('out-of-order sentence packets are ordered within a recording', () => {
   let state = p.reduce(p.initialState('s3'),transcript({segment_id:2,text:'丙'}));
   state = p.reduce(state,transcript({segment_id:0,text:'甲'}));
   state = p.reduce(state,transcript({segment_id:1,text:'乙'}));
-  assert.equal(p.groups(state)[0].text,'甲乙丙');
+  assert.equal(p.recordingText(state,'recording-a'),'甲乙丙');
 });
 test('streaming view patch sends the changed sentence rather than full history', () => {
   let state=p.reduce(p.initialState('s3'),transcript({recording_id:'old',final:true}));
@@ -75,7 +75,8 @@ test('recording identifiers cannot collide with object prototype names', () => {
 test('history and Unicode text are bounded without splitting surrogate pairs', () => {
   let state = p.initialState('s3');
   for (let n=0;n<p.MAX_SEGMENTS+10;n++) state=p.reduce(state,transcript({recording_id:'r'+n,text:'录音😀'.repeat(3000)}));
-  assert.equal(state.segments.length,p.MAX_SEGMENTS);
+  assert.ok(state.segments.length <= p.MAX_SEGMENTS);
+  assert.ok(state.text_units <= p.MAX_TEXT_UNITS);
   assert.equal(Array.from(state.segments[0].text).length,p.MAX_TEXT);
   assert.ok(!/[\ud800-\udbff]$/.test(state.segments[0].text));
 });

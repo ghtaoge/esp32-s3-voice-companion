@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 
+from .ort_session import build_cpu_model
+
 SAMPLE_RATE = 16000
 REQUIRED_FILES = {
     "online": ("model_quant.onnx", "decoder_quant.onnx", "config.yaml", "am.mvn", "tokens.json"),
@@ -75,10 +77,9 @@ class OnlineRecognizer:
     def __init__(self, model_root: Path, threads: int = 3):
         directory = _model_dir(model_root, "online")
         # The top-level funasr_onnx.Paraformer is OFFLINE, not this class.
-        from funasr_onnx.paraformer_online_bin import Paraformer
-
-        self.model = Paraformer(str(directory), batch_size=1, quantize=True,
-                                chunk_size=list(self.chunk_size), intra_op_num_threads=max(1, threads))
+        self.model = build_cpu_model("funasr_onnx.paraformer_online_bin", "Paraformer",
+                                     str(directory), batch_size=1, quantize=True,
+                                     chunk_size=list(self.chunk_size), intra_op_num_threads=max(1, threads))
         # The upstream frontend defaults to random one-LSB dither. Disable it
         # for repeatable inference/reset behavior on the same captured PCM.
         self.model.frontend.opts.frame_opts.dither = 0.0
@@ -161,10 +162,9 @@ class VadSegmenter:
 
     def __init__(self, model_root: Path, threads: int = 1):
         directory = _model_dir(model_root, "vad")
-        from funasr_onnx import Fsmn_vad_online
-
-        self.model = Fsmn_vad_online(str(directory), quantize=True,
-                                    intra_op_num_threads=max(1, threads), max_end_sil=600)
+        self.model = build_cpu_model("funasr_onnx.vad_bin", "Fsmn_vad_online",
+                                     str(directory), quantize=True,
+                                     intra_op_num_threads=max(1, threads), max_end_sil=600)
         self.model.config["frontend_conf"]["dither"] = 0.0
         self.reset()
 
@@ -218,9 +218,8 @@ class VadSegmenter:
 class Punctuator:
     def __init__(self, model_root: Path, threads: int = 1):
         directory = _model_dir(model_root, "punc")
-        from funasr_onnx import CT_Transformer
-
-        self.model = CT_Transformer(str(directory), quantize=True, intra_op_num_threads=max(1, threads))
+        self.model = build_cpu_model("funasr_onnx.punc_bin", "CT_Transformer",
+                                     str(directory), quantize=True, intra_op_num_threads=max(1, threads))
 
     def apply(self, text: str) -> str:
         if not text.strip():
@@ -254,9 +253,8 @@ class EmotionRecognizer:
 
     def __init__(self, model_root: Path, threads: int = 1):
         directory = _model_dir(model_root, "emotion")
-        from funasr_onnx import SenseVoiceSmall
-
-        self.model = SenseVoiceSmall(str(directory), quantize=True, batch_size=1,
+        self.model = build_cpu_model("funasr_onnx.sensevoice_bin", "SenseVoiceSmall",
+                                     str(directory), quantize=True, batch_size=1,
                                      intra_op_num_threads=max(1, threads))
         self.model.frontend.opts.frame_opts.dither = 0.0
 

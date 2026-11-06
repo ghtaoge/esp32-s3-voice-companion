@@ -10,6 +10,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 });
 const MAX_SEGMENTS = 160;
 const MAX_TEXT = 4096;
+const MAX_TEXT_UNITS = 64 * 1024;
 const MAX_PACKET = 512 * 1024;
 const EMOTIONS = Object.freeze({
   neutral: '平静', happy: '开心', sad: '低落', angry: '生气',
@@ -21,7 +22,18 @@ const MODES = Object.freeze({ page: '自动翻页', scroll: '向上滚动', type
 
 function object(value) { return value && typeof value === 'object' && !Array.isArray(value); }
 function integer(value, min, max) { return Number.isInteger(value) && value >= min && value <= max; }
-function boundedText(value, max) { return typeof value === 'string' ? Array.from(value).slice(0, max || MAX_TEXT).join('') : ''; }
+function boundedText(value, max) {
+  if (typeof value !== 'string') return '';
+  const limit = max || MAX_TEXT;
+  if (value.length <= limit) return value;
+  // Stop at the limit rather than allocating an array for an entire huge packet.
+  let end = 0, count = 0;
+  for (const point of value) {
+    if (count++ >= limit) break;
+    end += point.length;
+  }
+  return value.slice(0, end);
+}
 function safeId(value, max) { return typeof value === 'string' && value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value); }
 
 function validateSettings(value) {
@@ -93,6 +105,7 @@ function emotionValue(value) {
 }
 function initialState(deviceId) {
   return { device_id: deviceId || '', state: 'offline', recording_id: null, segments: [],
+    text_units:0,
     pending_emotions: {}, settings: Object.assign({}, DEFAULT_SETTINGS), settings_known: false,
     ready: false, message: '', last_done: null };
 }
@@ -100,7 +113,12 @@ function segmentKey(recordingId, segmentId) { return recordingId + ':' + segment
 function validSegment(value) {
   return safeId(value.recording_id, 64) && integer(value.segment_id, 0, 1000000);
 }
-function transcriptInto(next, message) {
+function trimHistory(next) {
+  while (next.segments.length > MAX_SEGMENTS || next.text_units > MAX_TEXT_UNITS) {
+    next.text_units -= next.segments.shift().text.length;
+  }
+}
+function transcriptInto(next, message, trim) {
   if (!validSegment(message) || !integer(message.revision, 0, Number.MAX_SAFE_INTEGER) ||
       typeof message.text !== 'string' || typeof message.final !== 'boolean') return;
   const key = segmentKey(message.recording_id, message.segment_id);
@@ -119,10 +137,11 @@ function transcriptInto(next, message) {
     start_ms: Number.isFinite(message.start_ms) ? Math.max(0, message.start_ms) : 0,
     end_ms: Number.isFinite(message.end_ms) ? Math.max(0, message.end_ms) : 0,
     emotion: emotionValue(message.emotion) || (previous && previous.emotion) || next.pending_emotions[key] || null };
+  next.text_units+=item.text.length-(previous?previous.text.length:0);
   if (index >= 0) next.segments[index] = item;
   else next.segments.push(item);
   delete next.pending_emotions[key];
-  if (next.segments.length > MAX_SEGMENTS) next.segments.splice(0, next.segments.length - MAX_SEGMENTS);
+  if(trim !== false)trimHistory(next);
 }
 function emotionInto(next, message) {
   if (!validSegment(message)) return;
@@ -139,7 +158,9 @@ function emotionInto(next, message) {
 
 function reduce(state, message) {
   if (!object(message) || (message.device_id && message.device_id !== state.device_id)) return state;
-  const next = Object.assign({}, state, { segments: state.segments.slice(), pending_emotions: Object.assign({}, state.pending_emotions) });
+  if(['hello','snapshot','status','transcript','emotion','recording_done','settings_applied'].indexOf(message.type)===-1)return state;
+  const next = Object.assign({}, state);
+  if(['snapshot','transcript','emotion'].indexOf(message.type)!==-1){next.segments=state.segments.slice();next.pending_emotions=Object.assign({},state.pending_emotions);}
   switch (message.type) {
     case 'hello':
       next.ready = message.ready === true;
@@ -147,11 +168,26 @@ function reduce(state, message) {
       break;
     case 'snapshot':
       if (Array.isArray(message.history)) {
-        message.history.slice(-MAX_SEGMENTS).forEach(item => {
+        const history=message.history.slice(-MAX_SEGMENTS);
+        history.forEach(item => {
           if (!object(item)) return;
           if (item.type === 'emotion') emotionInto(next, item);
-          else transcriptInto(next, item);
+          else transcriptInto(next, item, false);
         });
+        // A large repeated snapshot must not evict current entries while adding
+        // its older rows. Merge first, order its rows, and trim exactly once.
+        const byKey = new Map(next.segments.map(item => [item.key, item]));
+        const ordered = [], seen = new Set();
+        history.forEach(item => {
+          if (!object(item) || !validSegment(item)) return;
+          const key = segmentKey(item.recording_id, item.segment_id);
+          if (byKey.has(key) && !seen.has(key)) {
+            seen.add(key);
+            ordered.push(byKey.get(key));
+          }
+        });
+        next.segments = next.segments.filter(item => !seen.has(item.key)).concat(ordered);
+        trimHistory(next);
       }
       if (Object.prototype.hasOwnProperty.call(STATES, message.state)) next.state = message.state;
       next.recording_id = safeId(message.recording_id, 64) ? message.recording_id : null;
@@ -187,24 +223,52 @@ function emotionText(value) {
   if (value.status === 'error') return '情绪分析暂不可用';
   return EMOTIONS[value.label] || EMOTIONS.unknown;
 }
-function groups(state) {
-  const result = [];
-  const byRecording = Object.create(null);
-  state.segments.forEach(segment => {
-    let group = byRecording[segment.recording_id];
-    if (!group) {
-      group = { id: segment.recording_id, shortId: segment.recording_id.slice(-8), segments: [], text: '', final: true, active: state.recording_id === segment.recording_id };
-      byRecording[segment.recording_id] = group;
-      result.push(group);
-    }
-    group.segments.push(Object.assign({}, segment, { emotionText: emotionText(segment.emotion), seconds: (segment.start_ms / 1000).toFixed(1) }));
-  });
-  result.forEach(group => {
-    group.segments.sort((a,b) => a.segment_id - b.segment_id);
-    group.text = group.segments.map(item => item.text).join('');
-    group.final = group.segments.every(item => item.final);
-  });
-  return result.reverse();
+function groupBuilder() {
+  let sources = new Map(), cachedGroups = new Map();
+  return state => {
+    const result = [], byRecording = new Map(), nextSources = new Map(), nextGroups = new Map();
+    state.segments.forEach(segment => {
+      const cached = sources.get(segment.key);
+      const view = cached && cached.source === segment ? cached.view : Object.assign({}, segment, {
+        emotionText: emotionText(segment.emotion), seconds: (segment.start_ms / 1000).toFixed(1)
+      });
+      nextSources.set(segment.key, {source: segment, view});
+      let group = byRecording.get(segment.recording_id);
+      if (!group) {
+        group = {id: segment.recording_id, shortId: segment.recording_id.slice(-8), segments: [],
+          hasText: false, final: true, active: state.recording_id === segment.recording_id};
+        byRecording.set(group.id, group);
+        result.push(group);
+      }
+      group.segments.push(view);
+      group.hasText = group.hasText || Boolean(segment.text);
+      group.final = group.final && segment.final;
+    });
+    result.forEach((group, index) => {
+      group.segments.sort((a, b) => a.segment_id - b.segment_id);
+      const old = cachedGroups.get(group.id);
+      if (old && old.active === group.active && old.final === group.final && old.hasText === group.hasText &&
+          old.segments.length === group.segments.length && old.segments.every((segment, n) => segment === group.segments[n])) {
+        result[index] = old;
+      }
+      nextGroups.set(group.id, result[index]);
+    });
+    sources = nextSources;
+    cachedGroups = nextGroups;
+    return result.reverse();
+  };
+}
+function groups(state) { return groupBuilder()(state); }
+function recordingText(state, id) {
+  return state.segments.filter(item => item.recording_id === id)
+    .sort((a, b) => a.segment_id - b.segment_id).map(item => item.text).join('');
+}
+function sameViewSegment(a, b) {
+  if (a === b) return true;
+  const sameEmotion = !a.emotion && !b.emotion || (a.emotion && b.emotion &&
+    a.emotion.label === b.emotion.label && a.emotion.event === b.emotion.event && a.emotion.status === b.emotion.status);
+  return a.key === b.key && a.revision === b.revision && a.text === b.text && a.final === b.final &&
+    a.start_ms === b.start_ms && a.end_ms === b.end_ms && a.emotionText === b.emotionText && sameEmotion;
 }
 
 function groupPatch(previous, next) {
@@ -214,16 +278,17 @@ function groupPatch(previous, next) {
   const patch = {};
   next.forEach((group,index)=>{
     const old = previous[index];
-    ['text','final','active'].forEach(key=>{if(old[key] !== group[key]) patch['groups['+index+'].'+key]=group[key];});
+    if(old===group)return;
+    ['hasText','final','active'].forEach(key=>{if(old[key] !== group[key]) patch['groups['+index+'].'+key]=group[key];});
     if (old.segments.length !== group.segments.length || old.segments.some((segment,n)=>segment.key !== group.segments[n].key)) {
       patch['groups['+index+'].segments']=group.segments;
     } else group.segments.forEach((segment,n)=>{
-      if (JSON.stringify(old.segments[n]) !== JSON.stringify(segment)) patch['groups['+index+'].segments['+n+']']=segment;
+      if (!sameViewSegment(old.segments[n],segment)) patch['groups['+index+'].segments['+n+']']=segment;
     });
   });
   return patch;
 }
 
-module.exports = { DEFAULT_SETTINGS, EMOTIONS, STATES, MODES, MAX_SEGMENTS, MAX_TEXT,
+module.exports = { DEFAULT_SETTINGS, EMOTIONS, STATES, MODES, MAX_SEGMENTS, MAX_TEXT, MAX_TEXT_UNITS,
   validateSettings, normalizeConnection, parsePairing, socketURL, parseMessage,
-  initialState, reduce, groups, groupPatch, boundedText, emotionText };
+  initialState, reduce, groups, groupBuilder, recordingText, groupPatch, boundedText, emotionText };

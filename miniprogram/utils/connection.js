@@ -10,10 +10,13 @@ class Connection {
     this.setTimeout = options.setTimeout || setTimeout;
     this.clearTimeout = options.clearTimeout || clearTimeout;
     this.random = options.random || Math.random;
+    this.now = options.now || Date.now;
     this.foreground = false;
     this.enabled = false;
     this.task = null;
     this.opened = false;
+    this.openedAt = 0;
+    this.lastReceived = 0;
     this.epoch = 0;
     this.attempt = 0;
     this.handshakeFailures = 0;
@@ -70,7 +73,9 @@ class Connection {
       if (epoch !== this.epoch) return;
       opened = true;
       this.opened = true;
-      this.attempt = 0;
+      this.openedAt = this.lastReceived = this.now();
+      // Keep backoff through open-close flapping. It resets only after a
+      // connection has actually stayed up, or the user explicitly reconnects.
       this.handshakeFailures = 0;
       if (this.watchdog !== null) this.clearTimeout(this.watchdog);
       this.watchdog = null;
@@ -79,7 +84,7 @@ class Connection {
     });
     task.onMessage(event => {
       if (epoch !== this.epoch || !opened) return;
-      this.armWatchdog(epoch);
+      this.lastReceived = this.now();
       this.onMessage(event.data);
     });
     task.onClose(event => {
@@ -93,8 +98,14 @@ class Connection {
     task.onError(() => this.failed(epoch));
   }
   armWatchdog(epoch) {
-    if (this.watchdog !== null) this.clearTimeout(this.watchdog);
-    this.watchdog = this.setTimeout(() => this.failed(epoch), 35000);
+    if(this.watchdog!==null)return;
+    const remaining=Math.max(1,35000-(this.now()-this.lastReceived));
+    this.watchdog=this.setTimeout(()=>{
+      this.watchdog=null;
+      if(epoch!==this.epoch)return;
+      if(this.now()-this.lastReceived>=35000)this.failed(epoch);
+      else this.armWatchdog(epoch);
+    },remaining);
   }
   beat(epoch) {
     if (epoch !== this.epoch || !this.task) return;
@@ -119,9 +130,11 @@ class Connection {
   failed(epoch) {
     if (epoch !== this.epoch) return;
     const wasOpen = this.opened;
+    const stable = wasOpen && this.now()-this.openedAt>=10000;
     this.retire();
     if (!this.enabled || !this.foreground) return;
     this.handshakeFailures = wasOpen ? 0 : this.handshakeFailures + 1;
+    if(stable)this.attempt=0;
     const base = Math.min(15000, 800 * Math.pow(2, Math.min(this.attempt++, 5)));
     const delay = Math.round(base * (0.85 + this.random() * 0.3));
     this.onState('reconnecting', delay);

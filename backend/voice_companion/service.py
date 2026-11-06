@@ -15,7 +15,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from .config import Config
 from .emotion import EmotionService
 from .inference import ASREngine
-from .protocol import DEVICE_ID, RECORDING_ID, MAX_FRAME_BYTES, DisplaySettings, error_event, valid_level, validated_settings
+from .protocol import DEVICE_ID, RECORDING_ID, MAX_FRAME_BYTES, VAD_FRAME_BYTES, DisplaySettings, error_event, valid_level, validated_settings
 from .storage import HistoryStore
 
 
@@ -86,6 +86,8 @@ class Recording:
     stopped_at: float | None = None
     audio_bytes: int = 0
     queued_bytes: int = 0
+    peak_queued_bytes: int = 0
+    worker_calls: int = 0
     started: float = field(default_factory=time.monotonic)
 
 
@@ -303,6 +305,7 @@ class Hub:
         try:
             recording.queue.put_nowait(pcm)
             recording.queued_bytes += len(pcm)
+            recording.peak_queued_bytes = max(recording.peak_queued_bytes, recording.queued_bytes)
         except asyncio.QueueFull:
             await self.abort(recording, "audio_overload", "电脑处理落后于录音，已停止本次录音，请降低后台负载")
 
@@ -316,13 +319,18 @@ class Hub:
                 await recording.task
         device = self.devices[recording.device_id]
         self.publish(recording.device_id, error_event(code, message, recording_id=recording.recording_id))
-        self.status(device, "error", recording.recording_id, message)
-        self.emotion.set_asr_busy(False)
+        if device.recording_id == recording.recording_id:
+            self.status(device, "error", recording.recording_id, message)
+        # Cancelling a task yields. Another allowed device may have acquired the
+        # ASR slot in that interval; never resume analysis over its new recording.
+        if self.active is None:
+            self.emotion.set_asr_busy(False)
 
     async def run_recording(self, recording: Recording) -> None:
         loop = asyncio.get_running_loop()
         try:
             session = await loop.run_in_executor(self.engine.executor, self.engine.session)
+            pending = bytearray()
             while self.active is recording:
                 remaining = self.config.max_recording_seconds + 10 - (time.monotonic() - recording.started)
                 if remaining <= 0:
@@ -330,8 +338,16 @@ class Hub:
                     return
                 frame = await asyncio.wait_for(recording.queue.get(), min(remaining, self.config.idle_audio_timeout_seconds))
                 if frame is not None:
-                    recording.queued_bytes -= len(frame)
-                batch = await loop.run_in_executor(self.engine.executor, session.feed, frame or b"", frame is None)
+                    pending.extend(frame)
+                    # VAD and online feature extraction already wait for 100ms;
+                    # avoid 50 executor submissions/sec for 20ms transport frames.
+                    if len(pending) < VAD_FRAME_BYTES:
+                        continue
+                data = bytes(pending)
+                pending.clear()
+                recording.queued_bytes -= len(data)
+                recording.worker_calls += 1
+                batch = await loop.run_in_executor(self.engine.executor, session.feed, data, frame is None)
                 if self.active is not recording:
                     return
                 for event in batch.events:
@@ -348,6 +364,8 @@ class Hub:
                         "segments": session.segment_id, "audio_ms": session.audio_ms, "final_latency_ms": round(latency, 1),
                         "first_partial_ms": round(session.first_partial_ms, 1) if session.first_partial_ms is not None else None,
                         "asr_inference_ms": round(session.inference_ms, 1),
+                        "worker_calls": recording.worker_calls,
+                        "audio_queue_peak_ms": round(recording.peak_queued_bytes / 32, 1),
                         "message": "" if session.segment_id else "没有检测到可识别的语音"})
                     self.active = None
                     self.status(self.devices[recording.device_id], "idle", None)

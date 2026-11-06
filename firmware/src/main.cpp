@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include <driver/i2s_std.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <atomic>
 #include <math.h>
 #include "voice_core.h"
@@ -26,7 +27,10 @@ StaticQueue_t audioQueueControl;
 uint8_t* queueStorage = nullptr;
 voice::CaptureControl captureControl;
 portMUX_TYPE captureGuard = portMUX_INITIALIZER_UNLOCKED;
+DRAM_ATTR voice::DmaStamp dmaStamp;
+portMUX_TYPE dmaGuard = portMUX_INITIALIZER_UNLOCKED;
 std::atomic<uint32_t> captureFinished{0}, captureOverflow{0}, capturedSamples{0};
+std::atomic<uint32_t> captureDmaLoss{0};
 std::atomic<uint16_t> microphoneLevel{0};
 std::atomic<bool> micReady{false}, micFailed{false};
 WebSocketsClient socket;
@@ -68,6 +72,25 @@ voice::CaptureControl captureSnapshot() {
   portEXIT_CRITICAL(&captureGuard);
   return result;
 }
+voice::DmaStamp readDmaStamp() {
+  portENTER_CRITICAL(&dmaGuard);
+  const voice::DmaStamp result = dmaStamp;
+  portEXIT_CRITICAL(&dmaGuard);
+  return result;
+}
+bool IRAM_ATTR onDmaReceive(i2s_chan_handle_t, i2s_event_data_t* event, void*) {
+  const uint32_t now = static_cast<uint32_t>(esp_timer_get_time());
+  portENTER_CRITICAL_ISR(&dmaGuard);
+  dmaStamp.producedSamples += event->size / sizeof(int32_t); dmaStamp.endedUs = now;
+  portEXIT_CRITICAL_ISR(&dmaGuard);
+  return false;
+}
+bool IRAM_ATTR onDmaOverflow(i2s_chan_handle_t, i2s_event_data_t* event, void*) {
+  portENTER_CRITICAL_ISR(&dmaGuard);
+  dmaStamp.droppedSamples += event->size / sizeof(int32_t);
+  portEXIT_CRITICAL_ISR(&dmaGuard);
+  return false;
+}
 void requestCaptureStop(uint32_t atUs = 0) {
   const uint32_t cutoff = atUs ? atUs : micros();
   portENTER_CRITICAL(&captureGuard);
@@ -88,13 +111,14 @@ void buttonTask(void*) {
     const int edge = button.update(digitalRead(RECORD_BUTTON) == LOW, millis());
     if (edge) {
       ButtonEdge event{static_cast<int8_t>(edge), micros(), 0};
+      const voice::DmaStamp dma = readDmaStamp();
       portENTER_CRITICAL(&captureGuard);
       if (edge > 0) {
         // Publish the capture command HERE, before the loop sees this event.
         // A stalled WebSocket must neither lose the sentence head nor reset
         // a release cutoff already stored for the same generation.
-        heldEpoch = captureControl.press(event.atUs);
-        if (heldEpoch) { captureOverflow.store(0); capturedSamples.store(0); }
+        heldEpoch = captureControl.press(event.atUs, dma.droppedSamples);
+        if (heldEpoch) { captureOverflow.store(0); captureDmaLoss.store(0); capturedSamples.store(0); }
       } else captureControl.stop(heldEpoch, event.atUs);
       event.epoch = heldEpoch;
       if (edge < 0) heldEpoch = 0;
@@ -248,8 +272,11 @@ void captureTask(void*) {
   // Standard I2S always has two 32-bit slots (64 BCLK per WS frame).
   // Mono+LEFT extracts only the microphone whose L/R pin is tied to GND.
   config.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+  i2s_event_callbacks_t callbacks = {};
+  callbacks.on_recv = onDmaReceive; callbacks.on_recv_q_ovf = onDmaOverflow;
   if (i2s_new_channel(&channel, nullptr, &microphone) != ESP_OK ||
-      i2s_channel_init_std_mode(microphone, &config) != ESP_OK || i2s_channel_enable(microphone) != ESP_OK) {
+      i2s_channel_init_std_mode(microphone, &config) != ESP_OK ||
+      i2s_channel_register_event_callback(microphone, &callbacks, nullptr) != ESP_OK || i2s_channel_enable(microphone) != ESP_OK) {
     micFailed.store(true); Serial.println("I2S initialization failed"); vTaskDelete(nullptr); return;
   }
   micReady.store(true);
@@ -257,11 +284,15 @@ void captureTask(void*) {
   // Only samples within the current press/release interval enter the queue.
   int32_t raw[voice::FrameSamples];
   AudioFrame frame{};
+  voice::DmaReadClock audioClock;
   uint32_t seenEpoch = 0;
   for (;;) {
     size_t bytes = 0;
     esp_err_t result = i2s_channel_read(microphone, raw, sizeof(raw), &bytes, 40);
-    const uint32_t endedUs = micros();
+    const voice::DmaStamp dma = readDmaStamp();
+    const uint32_t samples = bytes / sizeof(int32_t);
+    // Date the data at its DMA sample position, not the task's wake-up time.
+    const uint32_t endedUs = audioClock.readEnd(samples, dma);
     const voice::CaptureControl command = captureSnapshot();
     const uint32_t generation = command.generation;
     if (result != ESP_OK || !bytes) {
@@ -270,8 +301,10 @@ void captureTask(void*) {
       continue;
     }
     if (!generation || captureFinished.load() == generation) continue;
+    if (command.hasDmaLoss(dma.droppedSamples)) {
+      captureDmaLoss.store(generation); captureFinished.store(generation); continue;
+    }
     if (generation != seenEpoch) { seenEpoch = generation; capturedSamples.store(0); }
-    const uint32_t samples = bytes / sizeof(int32_t);
     const uint32_t startUs = command.startUs;
     const uint32_t endUs = command.stopUs;
     const voice::SampleSpan span = voice::clipFrame(endedUs, samples, startUs, endUs);
@@ -283,7 +316,7 @@ void captureTask(void*) {
       energy += static_cast<int32_t>(sample) * static_cast<int32_t>(sample);
     }
     if (frame.size) {
-      microphoneLevel.store(static_cast<uint16_t>(sqrt(static_cast<double>(energy) / (frame.size / 2))));
+      microphoneLevel.store(static_cast<uint16_t>(sqrtf(static_cast<float>(energy) / (frame.size / 2))));
       if (xQueueSend(audioQueue, &frame, 0) != pdTRUE) {
         captureOverflow.store(generation); captureFinished.store(generation); continue;
       }
@@ -302,6 +335,7 @@ void startRecording(uint32_t pressedUs, uint32_t generation) {
   if (!micReady.load() || micFailed.load()) { failRecording("麦克风初始化失败", false); return; }
   if (!wsConnected || !serverReady) { failRecording("电脑服务未就绪", false); return; }
   if (captureOverflow.load() == generation) { failRecording("网络太慢录音取消", false); return; }
+  if (captureDmaLoss.load() == generation) { failRecording("采音丢帧请重试", false); return; }
   const uint64_t mac = ESP.getEfuseMac();
   snprintf(recordingId, sizeof(recordingId), "%08lx-%08lx-%08lx", static_cast<unsigned long>(mac >> 16), static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(epoch));
   lastSegment = lastRevision = -1;
@@ -337,6 +371,7 @@ void serviceRecording() {
   if (!active) return;
   const uint32_t now = millis();
   if (captureOverflow.load() == epoch) { failRecording("网络太慢录音取消"); return; }
+  if (captureDmaLoss.load() == epoch) { failRecording("采音丢帧请重试"); return; }
   if (micFailed.load()) { failRecording("麦克风读取失败"); return; }
   if (!released && now - beganMs >= MAX_RECORDING_MS) endRecording();
   if (!streamReady && now - beganMs > READY_TIMEOUT_MS) { failRecording("服务响应超时"); return; }
@@ -345,11 +380,14 @@ void serviceRecording() {
   ui::setLevel(released ? 0 : microphoneLevel.load());
   if (!streamReady || stopSent) return;
   AudioFrame frame;
+  const uint32_t sendStartedUs = micros();
   // Bound work per loop so incoming control/results and button release stay responsive.
   for (unsigned n = 0; n < 6; ++n) {
+    if (n && !voice::sendBudgetAvailable(sendStartedUs, micros())) break;
     if (xQueueReceive(audioQueue, &frame, 0) != pdTRUE) break;
     if (frame.epoch != epoch) continue;
     if (!socket.sendBIN(reinterpret_cast<uint8_t*>(frame.pcm), frame.size)) { failRecording("音频发送失败", false); return; }
+    if (captureOverflow.load() == epoch || captureDmaLoss.load() == epoch) { failRecording("音频过载请重试"); return; }
   }
   if (released && captureFinished.load() == epoch && uxQueueMessagesWaiting(audioQueue) == 0) {
     if (!sendControl("record_stop")) { failRecording("结束录音失败", false); return; }

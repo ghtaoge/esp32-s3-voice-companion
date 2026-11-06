@@ -24,7 +24,7 @@ function harness() {
       close(){task.closed=true;if(events.close)events.close({code:1000});}};
     tasks.push(task);return task;
   }};
-  const manager=new Connection({wx,onState:(...args)=>states.push(args),onMessage:value=>messages.push(value),setTimeout:later,clearTimeout:id=>timers.delete(id),random:()=>0.5});
+  const manager=new Connection({wx,onState:(...args)=>states.push(args),onMessage:value=>messages.push(value),setTimeout:later,clearTimeout:id=>timers.delete(id),random:()=>0.5,now:()=>time});
   return {manager,tasks,states,messages,advance,timers};
 }
 test('no background connections, and hide invalidates all pending callbacks', () => {
@@ -39,14 +39,14 @@ test('no background connections, and hide invalidates all pending callbacks', ()
   assert.equal(h.timers.size,0);
   h.manager.setForeground(true);assert.equal(h.tasks.length,2);
 });
-test('duplicate socket failures schedule one exponential retry and open resets backoff', () => {
+test('duplicate failures schedule one retry and only a stable open resets backoff', () => {
   const h=harness();h.manager.setForeground(true);h.manager.start('ws://pc/path');
   h.tasks[0].events.error();h.tasks[0].events.close({code:1006});
   assert.deepEqual(h.states[h.states.length-1],['reconnecting',800]);
   h.advance(799);assert.equal(h.tasks.length,1);
   h.advance(1);assert.equal(h.tasks.length,2);
   h.tasks[1].events.error();assert.deepEqual(h.states[h.states.length-1],['reconnecting',1600]);
-  h.advance(1600);h.tasks[2].events.open();h.tasks[2].events.error();
+  h.advance(1600);h.tasks[2].events.open();h.advance(10000);h.tasks[2].events.error();
   assert.deepEqual(h.states[h.states.length-1],['reconnecting',800]);
 });
 test('outgoing heartbeats cannot conceal a silent or half-open server connection', () => {

@@ -16,6 +16,9 @@ std::atomic<uint16_t> level{0};
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 uint8_t textFrame[voice::ScreenBytes];
 uint8_t nextFrame[voice::ScreenBytes];
+uint8_t bodyCache[voice::ScreenBytes], previousScreen[voice::ScreenBytes];
+voice::BodyFrameKey cachedBodyKey{};
+bool bodyCacheValid = false, previousScreenValid = false;
 uint16_t pageStarts[voice::MaxText + 1];
 bool available = false;
 uint32_t animationAt = 0;
@@ -29,8 +32,8 @@ int bodyTop = 12;
 uint16_t glyph(uint32_t cp) {
   return cp <= 0xFFFF && u8g2_IsGlyph(oled.getU8g2(), static_cast<uint16_t>(cp)) ? cp : '?';
 }
-size_t layout(const Snapshot& data, size_t start, bool draw, size_t visibleCharacters = SIZE_MAX) {
-  const size_t length = strlen(data.text);
+size_t layout(const Snapshot& data, size_t start, bool draw, size_t visibleCharacters = SIZE_MAX, size_t length = SIZE_MAX) {
+  if (length == SIZE_MAX) length = strlen(data.text);
   const int width = 128 / data.settings.scale;
   const int rows = max(1, (64 - bodyTop) / (16 * data.settings.scale));
   size_t offset = start, characters = 0;
@@ -55,7 +58,7 @@ void paginate(const Snapshot& data) {
   size_t offset = 0;
   const size_t length = strlen(data.text);
   while (offset < length && pages < voice::MaxText) {
-    const size_t next = layout(data, offset, false);
+    const size_t next = layout(data, offset, false, SIZE_MAX, length);
     if (next <= offset || next >= length) break;
     pageStarts[pages++] = static_cast<uint16_t>(next); offset = next;
   }
@@ -118,7 +121,12 @@ void render(const Snapshot& data, uint32_t now) {
   if (data.phase == Phase::Recording || data.phase == Phase::Processing) {
     page = pages - 1; shift = 0; visible = SIZE_MAX;
   }
-  renderText(data, page, shift, visible);
+  const voice::BodyFrameKey key{data.textVersion, page, shift, data.settings.scale, visible};
+  if (!bodyCacheValid || !(key == cachedBodyKey)) {
+    renderText(data, page, shift, visible);
+    memcpy(bodyCache, oled.getBufferPtr(), voice::ScreenBytes);
+    cachedBodyKey = key; bodyCacheValid = true;
+  } else memcpy(oled.getBufferPtr(), bodyCache, voice::ScreenBytes);
   if (bodyTop) {
     const char* label = data.phase == Phase::Recording ? "录音" : data.phase == Phase::Processing ? "识别" : data.phase == Phase::Offline ? "离线" : data.phase == Phase::Error ? "错误" : "就绪";
     oled.drawUTF8(0, 12, label);
@@ -139,7 +147,9 @@ void render(const Snapshot& data, uint32_t now) {
     oled.drawUTF8(0, 35, data.message[0] ? data.message : "按住BOOT说话");
     if (data.settings.animation) face(52, 44, data.emotion, now % 4000 < 130, data.phase == Phase::Recording ? level.load() : 0);
   }
-  oled.sendBuffer();
+  if (!previousScreenValid || memcmp(previousScreen, oled.getBufferPtr(), voice::ScreenBytes)) {
+    oled.sendBuffer(); memcpy(previousScreen, oled.getBufferPtr(), voice::ScreenBytes); previousScreenValid = true;
+  }
 }
 void displayTask(void*) {
   Wire.begin(OLED_SDA, OLED_SCL);
@@ -164,6 +174,10 @@ void displayTask(void*) {
     }
     if (data.settings.brightness != previousContrast) { oled.setContrast(data.settings.brightness); previousContrast = data.settings.brightness; }
     render(data, millis());
+    // Skip missed frames after a slow/broken I2C transfer instead of catching
+    // up in a burst of unpaced full-screen writes.
+    const TickType_t now = xTaskGetTickCount();
+    if (now - wake > pdMS_TO_TICKS(50)) wake = now;
     vTaskDelayUntil(&wake, pdMS_TO_TICKS(50));
   }
 }

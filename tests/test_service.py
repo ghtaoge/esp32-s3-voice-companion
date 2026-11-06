@@ -121,7 +121,10 @@ def test_release_flushes_tail_and_broadcasts_same_final(context):
         snapshot = until(phone, "snapshot")
         assert len(snapshot["history"]) == 1
         assert snapshot["history"][0] == board_final
-        assert engine.sessions[0].calls == [(bytes(640), False), (tail, False), (b"", True)]
+        calls = engine.sessions[0].calls
+        assert b"".join(pcm for pcm, _ in calls) == bytes(640) + tail
+        assert calls[-1][1] is True and not any(final for _, final in calls[:-1])
+        assert done["worker_calls"] == 1
 
 
 def test_final_and_delayed_emotion_survive_reconnect(context):

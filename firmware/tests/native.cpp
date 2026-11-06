@@ -71,5 +71,34 @@ int main() {
   assert(capture.stopUs == 0);
   assert(capture.stop(secondGeneration, 75000));
   assert(capture.stopUs == 75000);
-  std::cout << "PTT edges/debounce, UTF-8, PCM saturation, sample clipping, delayed-loop capture generations: passed\n";
+
+  // A late task wakeup must not date the oldest queued DMA block at "now".
+  voice::DmaReadClock clock;
+  voice::DmaStamp queued{960, 0, 60000}; // 60 ms produced, reader only now wakes
+  assert(clock.readEnd(320, queued) == 20000);
+  assert(clock.readEnd(320, queued) == 40000);
+  assert(clock.readEnd(320, queued) == 60000);
+  voice::DmaReadClock skipped;
+  queued = {960, 160, 60000}; // driver overwrote the first 10 ms DMA buffer
+  assert(skipped.readEnd(320, queued) == 30000);
+  assert(skipped.readEnd(320, queued) == 50000);
+  voice::CaptureControl integrity;
+  assert(integrity.arm(0));
+  const auto integrityEpoch = integrity.press(50000, 160);
+  assert(!integrity.hasDmaLoss(160)); // idle loss before this press is irrelevant
+  assert(integrity.hasDmaLoss(320)); // any new in-recording DMA loss invalidates it
+  integrity.retire(integrityEpoch, 60000);
+  assert(integrity.arm(integrityEpoch));
+  integrity.press(70000, 320);
+  assert(!integrity.hasDmaLoss(320)); // previous failed recording cannot poison the next
+  assert(voice::sendBudgetAvailable(UINT32_MAX - 1999, 1000));
+  assert(!voice::sendBudgetAvailable(1000, 5000));
+  voice::BodyFrameKey cached{1, 0, 0, 1, SIZE_MAX};
+  assert((cached == voice::BodyFrameKey{1, 0, 0, 1, SIZE_MAX}));
+  assert(!(cached == voice::BodyFrameKey{2, 0, 0, 1, SIZE_MAX}));
+  assert(!(cached == voice::BodyFrameKey{1, 1, 0, 1, SIZE_MAX}));
+  assert(!(cached == voice::BodyFrameKey{1, 0, 1, 1, SIZE_MAX}));
+  assert(!(cached == voice::BodyFrameKey{1, 0, 0, 2, SIZE_MAX}));
+  assert(!(cached == voice::BodyFrameKey{1, 0, 0, 1, 3}));
+  std::cout << "PTT/UTF8/PCM, delayed-loop generations, DMA backlog/loss clock, send pacing, OLED cache invalidation: passed\n";
 }

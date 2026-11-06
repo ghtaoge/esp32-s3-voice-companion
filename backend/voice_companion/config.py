@@ -17,6 +17,7 @@ class Config:
     port: int = 8765
     token: str = ""
     asr_threads: int = 3
+    asr_preroll_ms: int = 0
     emotion_enabled: bool = True
     emotion_max_seconds: int = 12
     max_recording_seconds: int = 60

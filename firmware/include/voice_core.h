@@ -45,26 +45,47 @@ inline int16_t pcm16(int32_t sample, unsigned shift) {
   return static_cast<int16_t>(value > 32767 ? 32767 : value < -32768 ? -32768 : value);
 }
 struct SampleSpan { uint32_t first, last; };
+struct DmaStamp { uint32_t producedSamples = 0, droppedSamples = 0, endedUs = 0; };
+struct DmaReadClock {
+  uint32_t consumedSamples = 0, seenDroppedSamples = 0;
+  uint32_t readEnd(uint32_t samples, const DmaStamp& stamp) {
+    // A dropped DMA buffer is skipped by the driver, not returned by read().
+    consumedSamples += samples + (stamp.droppedSamples - seenDroppedSamples);
+    seenDroppedSamples = stamp.droppedSamples;
+    const uint32_t pendingSamples = stamp.producedSamples - consumedSamples;
+    return stamp.endedUs - pendingSamples * 1000000u / 16000u;
+  }
+};
+inline bool sendBudgetAvailable(uint32_t startedUs, uint32_t nowUs) {
+  return static_cast<uint32_t>(nowUs - startedUs) < 4000u;
+}
+struct BodyFrameKey {
+  uint32_t textVersion; unsigned page; int shift; uint8_t scale; size_t visible;
+  bool operator==(const BodyFrameKey& other) const {
+    return textVersion == other.textVersion && page == other.page && shift == other.shift && scale == other.scale && visible == other.visible;
+  }
+};
 enum class CaptureGate : uint8_t { Disabled, Armed, Reserved };
 // Callers protect this small command with one critical section. The button
 // task owns press/release; the network task only reads or retires a generation.
 // In particular there is no network-side "start/reset stopUs" operation.
 struct CaptureControl {
   CaptureGate gate = CaptureGate::Disabled;
-  uint32_t generation = 0, startUs = 0, stopUs = 0;
+  uint32_t generation = 0, startUs = 0, stopUs = 0, dmaDropBaseline = 0;
   bool arm(uint32_t finishedGeneration) {
     if (gate != CaptureGate::Disabled || (generation && finishedGeneration != generation)) return false;
     gate = CaptureGate::Armed; return true;
   }
-  uint32_t press(uint32_t atUs) {
+  uint32_t press(uint32_t atUs, uint32_t droppedSamples = 0) {
     if (gate != CaptureGate::Armed) return 0;
     if (!++generation) ++generation;
-    startUs = atUs; stopUs = 0; gate = CaptureGate::Reserved;
+    startUs = atUs; stopUs = 0; dmaDropBaseline = droppedSamples; gate = CaptureGate::Reserved;
     return generation;
   }
   bool accepts(uint32_t expectedGeneration) const {
     return expectedGeneration && generation == expectedGeneration && gate == CaptureGate::Reserved;
   }
+  bool hasDmaLoss(uint32_t droppedSamples) const { return droppedSamples != dmaDropBaseline; }
   bool stop(uint32_t expectedGeneration, uint32_t atUs) {
     if (!expectedGeneration || generation != expectedGeneration) return false;
     if (!stopUs) stopUs = atUs ? atUs : 1;

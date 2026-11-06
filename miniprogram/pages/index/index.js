@@ -27,6 +27,11 @@ Page({
     this.pendingRequest = null;
     this.pendingTimer = null;
     this.renderTimer = null;
+    this.renderInFlight = false;
+    this.renderEpoch = 0;
+    this.renderDirty = false;
+    this.level = 0;
+    this.buildGroups = protocol.groupBuilder();
     this.privacyResolvers = [];
     this.connection = new Connection({ wx,
       onState:(name, delay) => this.connectionChanged(name, delay),
@@ -57,12 +62,15 @@ Page({
   onShow() { this.foreground = true; if (this.connection) this.connection.setForeground(true); },
   onHide() {
     this.foreground = false;
+    this.renderEpoch++; this.renderInFlight=false;
+    clearTimeout(this.renderTimer); this.renderTimer=null; this.renderDirty=false;
     if (this.connection) this.connection.setForeground(false);
     this.finishPending('页面已暂停；重新连接后读取实际设置');
     this.settlePrivacy('disagree');
   },
   onUnload() {
     this.unloaded = true;
+    this.renderEpoch++;
     this.foreground = false;
     if (this.connection) this.connection.destroy();
     clearTimeout(this.pendingTimer); clearTimeout(this.renderTimer);
@@ -85,6 +93,7 @@ Page({
       update.showConnection = false;
     }
     if (!connected) {
+      this.level = 0;
       update.level = 0;
       update.stateTitle = '等待连接电脑';
       this.finishPending('连接中断；重连后读取设备实际设置');
@@ -99,7 +108,10 @@ Page({
     if (message.type === 'level') {
       if (message.recording_id !== this.state.recording_id) return;
       const value = Number(message.level);
-      if (Number.isFinite(value)) this.setData({level:Math.round(Math.max(0,Math.min(1,value))*100)});
+      if (Number.isFinite(value)) {
+        const level=Math.round(Math.max(0,Math.min(1,value))*100);
+        if(this.level!==level){this.level=level;this.scheduleRender();}
+      }
       return;
     }
     if (message.type === 'error') {
@@ -137,6 +149,7 @@ Page({
       if (message.request_id && message.request_id === this.pendingRequest) this.finishPending('设备未应用这次设置');
       return;
     }
+    const previousState=this.state;
     this.state = protocol.reduce(this.state, message);
     if (message.type === 'settings_pending' && message.request_id === this.pendingRequest) this.setData({settingsStatus:'电脑已转发，等待开发板确认…'});
     if (message.type === 'settings_applied' && message.request_id === this.pendingRequest) {
@@ -146,15 +159,21 @@ Page({
         this.setData({draftDirty:false, notice:'屏幕设置已由开发板确认'});
       } catch (_) { this.finishPending('设备确认格式不正确，请重新读取设置'); }
     }
-    const canSyncDraft = !this.data.draftDirty && !this.data.pending;
+    const canSyncDraft = ['hello','snapshot','settings_applied'].indexOf(message.type)!==-1 && !this.data.draftDirty && !this.data.pending;
     if (this.state.settings_known && canSyncDraft) this.setDraft(this.state.settings, false);
-    if (message.type === 'snapshot' || message.type === 'status') this.setData({notice:'', errorText:''});
+    if ((message.type === 'snapshot' || message.type === 'status') && (this.data.notice||this.data.errorText)) this.setData({notice:'', errorText:''});
     // Subtitle bursts can arrive faster than the view can render. Merge every
     // message immediately, and render at most 12.5 Hz without dropping state.
-    if (!this.renderTimer) this.renderTimer = setTimeout(() => { this.renderTimer = null; this.renderState(); }, 80);
+    if(this.state!==previousState)this.scheduleRender();
+  },
+  scheduleRender() {
+    this.renderDirty=true;
+    if(this.unloaded||!this.foreground||this.renderTimer||this.renderInFlight)return;
+    this.renderTimer=setTimeout(()=>{this.renderTimer=null;this.renderDirty=false;this.renderState();},80);
   },
   renderState() {
-    if (this.unloaded) return;
+    if (this.unloaded || !this.foreground) return;
+    if(this.renderInFlight){this.renderDirty=true;return;}
     const state = this.state;
     const done = state.last_done;
     let timing = '';
@@ -169,10 +188,26 @@ Page({
       message='请在电脑检查本地模型与服务状态；修复模型后重启服务，再重新连接。';
     }
     const s = state.settings;
-    this.setData(Object.assign(protocol.groupPatch(this.data.groups,protocol.groups(state)),{state:state.state, stateTitle:title, stateMessage:message, ready:state.ready,
+    const patch=protocol.groupPatch(this.data.groups,this.buildGroups(state));
+    const fields={state:state.state, stateTitle:title, stateMessage:message, ready:state.ready,
       lastTiming:timing, applied:Object.assign({},s), appliedKnown:state.settings_known,
       appliedSummary:state.settings_known ? s.font_scale + ' 倍字号 · ' + protocol.MODES[s.display_mode] + ' · 亮度 ' + s.brightness : '尚未读取设备设置',
-      level:state.state === 'recording' ? this.data.level : 0}));
+      level:state.state === 'recording' ? this.level : 0};
+    Object.keys(fields).forEach(key=>{
+      if(key==='applied'){
+        if(Object.keys(s).some(name=>this.data.applied[name]!==s[name]))patch.applied=fields.applied;
+      }else if(this.data[key]!==fields[key])patch[key]=fields[key];
+    });
+    if(!Object.keys(patch).length)return;
+    // At most one subtitle bridge update can be outstanding. A slow view gets
+    // the newest merged state after its callback, not an unbounded update queue.
+    this.renderInFlight=true;
+    const epoch=this.renderEpoch;
+    this.setData(patch,()=>{
+      if(this.unloaded || epoch!==this.renderEpoch)return;
+      this.renderInFlight=false;
+      if(this.renderDirty)this.scheduleRender();
+    });
   },
   editConnection() { this.setData({showConnection:!this.data.showConnection}); },
   inputConnection(event) {
@@ -216,7 +251,13 @@ Page({
   selectTab(event) { this.setData({tab:event.currentTarget.dataset.tab}); },
   setDraft(value, dirty) {
     const draft=Object.assign({},value);
-    this.setData({draft,draftDirty:Boolean(dirty),modeIndex:Math.max(0,MODE_KEYS.indexOf(draft.display_mode)),draftPageSeconds:(draft.page_ms/1000).toFixed(1)});
+    const patch={};
+    if(Object.keys(protocol.DEFAULT_SETTINGS).some(key=>this.data.draft[key]!==draft[key]))patch.draft=draft;
+    if(this.data.draftDirty!==Boolean(dirty))patch.draftDirty=Boolean(dirty);
+    const modeIndex=Math.max(0,MODE_KEYS.indexOf(draft.display_mode)),seconds=(draft.page_ms/1000).toFixed(1);
+    if(this.data.modeIndex!==modeIndex)patch.modeIndex=modeIndex;
+    if(this.data.draftPageSeconds!==seconds)patch.draftPageSeconds=seconds;
+    if(Object.keys(patch).length)this.setData(patch);
   },
   fontChanged(event) { this.setDraft(Object.assign({},this.data.draft,{font_scale:Number(event.detail.value)+1}),true); },
   modeChanged(event) { this.setDraft(Object.assign({},this.data.draft,{display_mode:MODE_KEYS[Number(event.detail.value)]}),true); },
@@ -247,8 +288,8 @@ Page({
     if (!this.unloaded && hadPending) this.setData({pending:false,settingsStatus:text});
   },
   copyTranscript(event) {
-    const group=this.data.groups.find(item=>item.id===event.currentTarget.dataset.id);
-    if (group && group.text) wx.setClipboardData({data:group.text,fail:()=>wx.showToast({title:'复制失败',icon:'none'})});
+    const text=protocol.recordingText(this.state,event.currentTarget.dataset.id);
+    if (text) wx.setClipboardData({data:text,fail:()=>wx.showToast({title:'复制失败',icon:'none'})});
   },
   openPrivacy() { if (wx.openPrivacyContract) wx.openPrivacyContract({fail:()=>wx.showToast({title:'请先在小程序后台配置隐私指引',icon:'none'})}); },
   agreePrivacy() { this.settlePrivacy('agree'); },
