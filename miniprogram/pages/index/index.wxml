@@ -1,0 +1,151 @@
+<view class="page">
+  <view class="heading">
+    <view>
+      <view class="eyebrow">LOCAL VOICE COMPANION</view>
+      <view class="title">听见你的每一句</view>
+      <view class="subtitle">本地识别，电脑同步，屏幕回应。</view>
+    </view>
+    <button class="connection-toggle" bindtap="editConnection" aria-label="编辑电脑连接">
+      <view class="connection-dot {{connected ? 'is-connected' : ''}}"></view>
+      <text>{{connected ? '已连接' : '连接'}}</text>
+    </button>
+  </view>
+
+  <view wx:if="{{showConnection}}" class="panel connection-panel">
+    <view class="panel-heading">
+      <view class="panel-title">连接你的电脑</view>
+      <button class="quiet small-button" bindtap="scanPairing">扫码配对</button>
+    </view>
+    <view class="field">
+      <view class="field-label">电脑服务地址</view>
+      <input class="input" value="{{address}}" data-field="address" bindinput="inputConnection" placeholder="ws://192.168.1.100:8765" placeholder-class="placeholder" maxlength="1024" cursor-spacing="24" aria-label="电脑 WebSocket 地址" />
+    </view>
+    <view class="field">
+      <view class="field-label">设备标识</view>
+      <input class="input" value="{{deviceId}}" data-field="deviceId" bindinput="inputConnection" placeholder="与开发板配置保持一致" placeholder-class="placeholder" maxlength="40" cursor-spacing="24" aria-label="设备标识" />
+    </view>
+    <view class="field">
+      <view class="field-label">配对口令</view>
+      <input class="input" password value="{{token}}" data-field="token" bindinput="inputConnection" placeholder="由电脑本地生成" placeholder-class="placeholder" maxlength="256" cursor-spacing="24" aria-label="配对口令" />
+    </view>
+    <view class="option-row remember-row">
+      <text>在这台手机记住连接</text>
+      <switch checked="{{remember}}" bindchange="rememberChanged" aria-label="记住连接信息" />
+    </view>
+    <view class="connection-actions">
+      <button class="primary" bindtap="connect">{{connected ? '重新连接' : '连接电脑'}}</button>
+      <button wx:if="{{connectionState !== 'disconnected' && connectionState !== 'paused'}}" class="secondary" bindtap="disconnect">断开</button>
+    </view>
+    <view class="caption">手机和电脑需在同一网段。配对口令只保存在当前手机，不要分享连接二维码。</view>
+  </view>
+
+  <view wx:if="{{errorText}}" class="message error" aria-role="alert">{{errorText}}</view>
+  <view wx:if="{{notice}}" class="message notice">{{notice}}</view>
+
+  <view class="tabs" aria-role="tablist" aria-label="功能切换">
+    <button class="tab {{tab === 'live' ? 'active' : ''}}" data-tab="live" bindtap="selectTab" aria-role="tab" aria-selected="{{tab === 'live'}}">语音字幕</button>
+    <button class="tab {{tab === 'settings' ? 'active' : ''}}" data-tab="settings" bindtap="selectTab" aria-role="tab" aria-selected="{{tab === 'settings'}}">屏幕设置</button>
+  </view>
+
+  <view wx:if="{{tab === 'live'}}">
+    <view class="listening-panel {{connected && state === 'recording' ? 'is-listening' : ''}}">
+      <view class="companion {{state === 'processing' ? 'thinking' : ''}}" aria-hidden="true">
+        <view class="face">
+          <view class="eyes"><view class="eye"></view><view class="eye"></view></view>
+          <view class="mouth {{connected && state === 'recording' ? 'speaking' : ''}}"></view>
+        </view>
+      </view>
+      <view class="state-copy">
+        <view class="state-title">{{stateTitle}}</view>
+        <view class="state-description">{{stateMessage}}</view>
+      </view>
+      <view class="level-track" aria-label="实时音量 {{level}}%"><view class="level-fill" style="width:{{level}}%;"></view></view>
+      <view class="live-footer">
+        <view class="live-indicator"><view class="status-dot {{connected ? 'online' : ''}}"></view>{{connectionTitle}}</view>
+        <text wx:if="{{connected}}">{{ready ? '模型就绪' : '模型未就绪'}}</text>
+      </view>
+    </view>
+
+    <view class="section-heading">
+      <view class="panel-title">最近的对话</view>
+      <view class="caption">{{groups.length}} 段录音</view>
+    </view>
+    <view wx:if="{{lastTiming}}" class="timing">{{lastTiming}}</view>
+    <view wx:if="{{!groups.length}}" class="empty-state">
+      <view class="empty-symbol">Aa</view>
+      <view class="empty-title">第一句话，从按下 BOOT 开始</view>
+      <view class="caption">按住说话，松开结束。停顿会自动断句，识别后的字幕会出现在这里和 OLED 上。</view>
+    </view>
+    <view wx:for="{{groups}}" wx:key="id" class="panel transcript-card">
+      <view class="transcript-heading">
+        <view class="record-label"><view class="record-dot {{item.active ? 'recording' : ''}}"></view><text>{{item.active ? '本次录音' : '录音'}} · {{item.shortId}}</text></view>
+        <button class="quiet small-button" data-id="{{item.id}}" bindtap="copyTranscript" disabled="{{!item.text}}">复制</button>
+      </view>
+      <view wx:for="{{item.segments}}" wx:for-item="segment" wx:key="key" class="segment">
+        <view class="segment-text {{!segment.final ? 'partial' : ''}}" user-select>{{segment.text || '…'}}</view>
+        <view class="segment-meta">
+          <text>{{segment.seconds}}s</text>
+          <text wx:if="{{!segment.final}}" class="partial-label">实时字幕 · 待确认</text>
+          <text wx:if="{{segment.emotionText}}" class="emotion-label">{{segment.emotionText}}</text>
+          <text wx:if="{{segment.emotion && segment.emotion.event}}">{{segment.emotion.event}}</text>
+        </view>
+      </view>
+    </view>
+    <view wx:if="{{groups.length}}" class="footnote">情绪标签来自本地语音模型，可能晚于字幕到达；未返回标签时不推断情绪。</view>
+  </view>
+
+  <view wx:if="{{tab === 'settings'}}">
+    <view class="panel applied-panel">
+      <view class="eyebrow">OLED · 128 × 64</view>
+      <view class="panel-title">设备当前设置</view>
+      <view class="applied-summary">{{appliedSummary}}</view>
+      <view class="settings-status {{pending ? 'pending' : ''}}">{{settingsStatus}}</view>
+    </view>
+    <view class="panel settings-panel">
+      <view class="option-row">
+        <view><view class="field-label">字体大小</view><view class="caption">字号越大，每页能显示的文字越少</view></view>
+        <picker mode="selector" range="{{fontOptions}}" value="{{draft.font_scale - 1}}" bindchange="fontChanged" disabled="{{pending}}">
+          <view class="picker-value">{{draft.font_scale}} 倍 <text class="chevron">⌄</text></view>
+        </picker>
+      </view>
+      <view class="option-row divided">
+        <view class="field-label">文字展示</view>
+        <picker mode="selector" range="{{modeOptions}}" value="{{modeIndex}}" bindchange="modeChanged" disabled="{{pending}}">
+          <view class="picker-value">{{modeOptions[modeIndex]}} <text class="chevron">⌄</text></view>
+        </picker>
+      </view>
+      <view class="slider-field divided">
+        <view class="option-row"><view class="field-label">翻页停留</view><text class="setting-value">{{draftPageSeconds}} 秒</text></view>
+        <slider min="500" max="10000" step="500" value="{{draft.page_ms}}" data-field="page_ms" bindchange="sliderChanged" disabled="{{pending}}" aria-label="翻页停留毫秒数" />
+      </view>
+      <view class="slider-field divided">
+        <view class="option-row"><view class="field-label">滚动速度</view><text class="setting-value">{{draft.scroll_speed}} 像素/秒</text></view>
+        <slider min="5" max="60" step="1" value="{{draft.scroll_speed}}" data-field="scroll_speed" bindchange="sliderChanged" disabled="{{pending}}" aria-label="滚动速度" />
+      </view>
+      <view class="slider-field divided">
+        <view class="option-row"><view class="field-label">屏幕亮度</view><text class="setting-value">{{draft.brightness}} / 255</text></view>
+        <slider min="1" max="255" step="1" value="{{draft.brightness}}" data-field="brightness" bindchange="sliderChanged" disabled="{{pending}}" aria-label="屏幕亮度" />
+      </view>
+      <view class="option-row divided">
+        <view><view class="field-label">角色动画</view><view class="caption">待机眨眼、录音嘴形与情绪动作</view></view>
+        <switch checked="{{draft.animation}}" bindchange="animationChanged" disabled="{{pending}}" aria-label="启用角色动画" />
+      </view>
+    </view>
+    <view class="settings-actions">
+      <button class="primary" bindtap="applySettings" loading="{{pending}}" disabled="{{!connected || pending || state === 'offline'}}">{{pending ? '等待开发板确认' : '应用到 OLED'}}</button>
+      <button class="quiet" bindtap="restoreApplied" disabled="{{!appliedKnown || pending || !draftDirty}}">恢复设备当前设置</button>
+    </view>
+    <view class="footnote">修改先保留为草稿。只有收到开发板确认，才会显示已应用；确认后的设置由开发板保存。</view>
+  </view>
+
+  <view class="bottom-note">ESP32-S3 × INMP441 × FunASR</view>
+
+  <view wx:if="{{showPrivacy}}" class="privacy-mask" catchtap="rejectPrivacy">
+    <view class="privacy-panel" catchtap="ignoreTap">
+      <view class="panel-title">扫码连接电脑</view>
+      <view class="privacy-copy">扫码用于读取你电脑展示的配对信息。请阅读并同意<text class="privacy-link" bindtap="openPrivacy">{{privacyName}}</text>。也可以取消后手动填写连接信息。</view>
+      <button id="voice-privacy-agree" class="primary" open-type="agreePrivacyAuthorization" bindagreeprivacyauthorization="agreePrivacy">同意并扫码</button>
+      <button class="quiet" bindtap="rejectPrivacy">手动填写</button>
+    </view>
+  </view>
+</view>

@@ -1,0 +1,4 @@
+{
+  "light": {"navBackground":"#f5f7f8","navText":"black","background":"#f5f7f8","backgroundText":"dark"},
+  "dark": {"navBackground":"#111719","navText":"white","background":"#111719","backgroundText":"light"}
+}

@@ -1,0 +1,51 @@
+# 局域网协议 v1
+
+电脑是唯一字幕与设置分发端。音频不经过小程序或 BLE。默认 TCP 端口 8765，PCM 为 16000 Hz、单声道、signed PCM16 little-endian。
+
+## 连接
+
+- 开发板：`/ws/device/{device_id}?token={pairing_token}`。
+- 小程序：`/ws/client/{device_id}?token={pairing_token}`。
+- `device_id` 仅允许 `[A-Za-z0-9_-]{1,40}`。
+- token 是本地生成的随机配对口令，勿提交。两种连接都由客户端主动发起。开发板同 ID 重连替换旧连接、结束旧录音。慢客户端不能阻塞音频。
+- GET `/api/health` 只报告就绪与模型状态；配对详情与历史不在未认证健康接口返回。
+
+## 开发板 → 电脑
+
+JSON 字段 `type` 标识消息。所有控制消息与二进制音频按同一 WebSocket 顺序发送。
+
+- `hello`: `protocol:1, firmware:"...", settings:{...}`。电脑回当前状态与最近字幕。
+- `record_start`: `recording_id`（设备生成的唯一字符串，<=64字符）。服务回 `record_ready` 后发送音频。为保留按下后的句首，设备在等待 ready 期间缓存本次音频。模型未就绪/忙时返回 error，不伪造结果。
+- binary: 20 ms / 640 字节为常用帧；最后一帧可以较短但必须偶数字节。上限 6400 字节/帧；后端有有界队列，溢出明确失败，不静默丢音。
+- `record_stop`: `recording_id`。必须在所有已采集尾包之后发送。松开后停止采音；中间停顿不会结束整次录音。
+- `record_cancel`: `recording_id`，丢弃当前录音。
+- `level`: `recording_id, level`（0..1），最多 10Hz。
+- `settings_ack`: `request_id, settings`（实际应用值），可附 `error`。收到设备确认后电脑才向小程序报告已应用。
+
+## 小程序 → 电脑
+
+- `settings_set`: `request_id, settings`，仅允许下表字段。电脑校验后转发开发板。设备不在线则返回错误，不宣称应用成功。
+- `history_get`: 请求最近字幕。连接成功也会收到 `snapshot`。
+- `ping`: 返回 `pong`，用于前台保活。
+
+设置：`font_scale` 1/2/3/4；`display_mode` `page`/`scroll`/`typewriter`/`static`；`page_ms` 500..10000；`scroll_speed` 5..60 px/s；`brightness` 1..255；`animation` boolean。
+
+## 电脑 → 两端
+
+- `hello`: `protocol:1, device_id, ready, settings`。
+- `record_ready`: `recording_id`。设备开始排出本次缓存并持续发送。
+- `status`: `state` 为 `offline`/`idle`/`recording`/`processing`/`error`，带 `device_id, recording_id`（无则 null）、可选 `message`。
+- `transcript`: `device_id, recording_id, segment_id`（整数，从0递增）, `revision`（整数）, `text, final`（boolean）, `start_ms, end_ms`。同录音同分句以 revision 较新者覆盖，不能追加两遍结果。`final:true` 是分句完成，不代表整次录音完成。
+- `emotion`: `device_id, recording_id, segment_id, label, event`；可有 `status`（`ready`/`skipped`/`error`）。label 为 SenseVoice 原始标签映射：neutral/happy/sad/angry/fearful/disgusted/surprised/unknown。没有识别标签时必须 unknown，不能按关键词伪造情绪；不提供模型没有输出的置信度。
+- `recording_done`: `recording_id, segments, audio_ms, final_latency_ms`，松键之后所有分句最终结果已发出；情绪结果可稍后单独到达。
+- `settings_set`: 只发设备，`request_id, settings`。
+- `settings_applied`: 两端，`request_id, settings`，仅由设备 ACK 触发。
+- `settings_pending`: 只发请求客户端，尚待设备 ACK。
+- `error`: `code, message`，可有 `recording_id, request_id`。新录音/断线后旧异步结果不得改写当前录音状态。
+- `snapshot`: `device_id, state, recording_id, settings, history`。history 为有界最近 `transcript` 与 `emotion` 合并记录，按录音、分句键覆盖。
+
+## 按住录音状态机
+
+启动先等按钮释放；按下与松开消抖约25ms。按下→缓存采音+请求 ready→流式上传；松开→停止采音→排空尾包→stop→等待 recording_done。busy/断网/过载要显示明确错误并要求先释放再按，不把旧音频续进下一次录音。最长单次录音默认60秒，可配置。
+
+OLED 的音量与嘴形直接使用本机 PCM RMS，不等待服务端。I²S 采集、网络、显示各自运行，显示最多20 FPS。电脑发送临时字幕但不用固定频率发送整份历史。

@@ -1,0 +1,1 @@
+{"desc":"设备控制界面不参与微信搜索索引", "rules":[{"action":"disallow","page":"*"}]}

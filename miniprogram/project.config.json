@@ -1,0 +1,25 @@
+{
+  "appid": "touristappid",
+  "projectname": "esp32-s3-voice-companion",
+  "description": "ESP32-S3 本地语音字幕与 OLED 互动",
+  "compileType": "miniprogram",
+  "miniprogramRoot": "./",
+  "setting": {
+    "es6": true,
+    "enhance": true,
+    "minified": true,
+    "postcss": true,
+    "urlCheck": true,
+    "minifyWXSS": true,
+    "minifyWXML": true,
+    "uploadWithSourceMap": false
+  },
+  "packOptions": {
+    "ignore": [
+      {"type":"folder","value":"tests"},
+      {"type":"file","value":"package.json"},
+      {"type":"file","value":"README.md"}
+    ],
+    "include": []
+  }
+}

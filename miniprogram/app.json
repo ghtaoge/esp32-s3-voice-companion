@@ -1,0 +1,14 @@
+{
+  "pages": ["pages/index/index"],
+  "window": {
+    "navigationBarTitleText": "语音小精灵",
+    "navigationBarBackgroundColor": "@navBackground",
+    "navigationBarTextStyle": "@navText",
+    "backgroundColor": "@background",
+    "backgroundTextStyle": "@backgroundText"
+  },
+  "darkmode": true,
+  "themeLocation": "theme.json",
+  "style": "v2",
+  "sitemapLocation": "sitemap.json"
+}
