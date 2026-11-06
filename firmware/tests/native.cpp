@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <iostream>
 #include <limits.h>
+#include <string>
 
 int main() {
   // Holding BOOT during application startup must never start a recording.
@@ -28,6 +29,16 @@ int main() {
   assert(voice::copyUtf8(text, sizeof(text), "a\xe4\xbd") == 1);
   assert(voice::copyUtf8(text, sizeof(text), "ok\xc0\x80") == 2);
   assert(voice::copyUtf8(text, sizeof(text), "ok\xed\xa0\x80") == 2);
+  // Display is exact and byte-bounded, including ASCII originals longer than
+  // the editor's separate 512-code-point correction limit.
+  const std::string english(768, 'a'), maximum(voice::MaxText, 'a'), tooLong(voice::MaxText + 1, 'a');
+  assert(voice::validDisplayText(english.data(), english.size()));
+  assert(voice::validDisplayText(maximum.data(), maximum.size()));
+  assert(!voice::validDisplayText(tooLong.data(), tooLong.size()));
+  assert(!voice::validDisplayText("", 0));
+  assert(!voice::validDisplayText("bad\xf0\x9f", 5));
+  assert(!voice::validDisplayText("a\0b", 3));
+  assert(voice::validDisplayText("你好\nworld", strlen("你好\nworld")));
 
   assert(voice::pcm16(INT32_MAX, 14) == 32767);
   assert(voice::pcm16(INT32_MIN, 14) == -32768);
@@ -72,6 +83,25 @@ int main() {
   assert(capture.stop(secondGeneration, 75000));
   assert(capture.stopUs == 75000);
 
+  // Regression: display checked idle before a button task published a new
+  // reservation. Its UI commit rechecks the live gate/generation, and must
+  // reject rather than ACK an update overwritten before beginRecording().
+  voice::CaptureControl display;
+  assert(display.arm(0));
+  const auto idleGeneration = display.generation;
+  assert(voice::historyDisplayAllowed(display, false, idleGeneration));
+  assert(!voice::historyDisplayAllowed(display, true, idleGeneration)); // ASR processing
+  const auto pressedGeneration = display.press(1000);
+  assert(!voice::historyDisplayAllowed(display, false, idleGeneration));
+  assert(!voice::historyDisplayAllowed(display, false, pressedGeneration)); // Reserved before loop attaches
+  display.retire(pressedGeneration, 2000);
+  assert(!voice::historyDisplayAllowed(display, false, idleGeneration)); // stale idle snapshot remains stale
+  assert(!voice::historyDisplayAllowed(display, true, pressedGeneration)); // final ASR is still pending
+  assert(voice::historyDisplayAllowed(display, false, pressedGeneration));
+  assert(display.arm(pressedGeneration));
+  assert(voice::historyDisplayAllowed(display, false, pressedGeneration)); // applying display never disarms PTT
+  assert(display.press(3000) != 0); // next BOOT still takes priority
+
   // A late task wakeup must not date the oldest queued DMA block at "now".
   voice::DmaReadClock clock;
   voice::DmaStamp queued{960, 0, 60000}; // 60 ms produced, reader only now wakes
@@ -100,5 +130,10 @@ int main() {
   assert(!(cached == voice::BodyFrameKey{1, 0, 1, 1, SIZE_MAX}));
   assert(!(cached == voice::BodyFrameKey{1, 0, 0, 2, SIZE_MAX}));
   assert(!(cached == voice::BodyFrameKey{1, 0, 0, 1, 3}));
-  std::cout << "PTT/UTF8/PCM, delayed-loop generations, DMA backlog/loss clock, send pacing, OLED cache invalidation: passed\n";
+  assert(voice::textBaseline(4, 12) == 11); // history badge + full 4x font box
+  assert(voice::textBaseline(4, 0) == 13); // regular large text is unchanged
+  assert(voice::textBaseline(3, 12) == 13);
+  assert((voice::textBaseline(4, 12) + 2) * 4 <= 64 - 12);
+  assert(voice::textBaseline(4, 12) >= 11); // no glyph top is clipped either
+  std::cout << "PTT/UTF8/PCM, history display byte bounds/generation race, delayed-loop generations, DMA backlog/loss clock, send pacing, OLED cache invalidation: passed\n";
 }

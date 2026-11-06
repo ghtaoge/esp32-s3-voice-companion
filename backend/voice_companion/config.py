@@ -27,6 +27,7 @@ class Config:
     peer_queue_messages: int = 48
     history_limit: int = 50
     settings_timeout_seconds: float = 8.0
+    display_timeout_seconds: float = 8.0
     idle_audio_timeout_seconds: float = 10.0
     allowed_devices: set[str] = field(default_factory=lambda: {"esp32-s3"})
 

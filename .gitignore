@@ -31,3 +31,5 @@ pairing*.json
 *.code-workspace
 .DS_Store
 Thumbs.db
+output/playwright/
+.playwright-cli/

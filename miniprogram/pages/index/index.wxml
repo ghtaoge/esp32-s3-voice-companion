@@ -71,6 +71,7 @@
       <view class="caption">{{groups.length}} 段录音</view>
     </view>
     <view wx:if="{{lastTiming}}" class="timing">{{lastTiming}}</view>
+    <view wx:if="{{historyDisplayHint}}" class="caption history-upgrade">{{historyDisplayHint}}</view>
     <view wx:if="{{!groups.length}}" class="empty-state">
       <view class="empty-symbol">Aa</view>
       <view class="empty-title">第一句话，从按下 BOOT 开始</view>
@@ -82,16 +83,41 @@
         <button class="quiet small-button" data-id="{{item.id}}" bindtap="copyTranscript" disabled="{{!item.hasText}}">复制</button>
       </view>
       <view wx:for="{{item.segments}}" wx:for-item="segment" wx:key="key" class="segment">
-        <view class="segment-text {{!segment.final ? 'partial' : ''}}" user-select>{{segment.text || '…'}}</view>
+        <view class="segment-text {{!segment.final ? 'partial' : ''}}" user-select><text wx:for="{{segment.cueTokens}}" wx:for-item="tokenPart" wx:key="start" class="{{tokenPart.highlight ? 'text-cue' : ''}} {{tokenPart.negated ? 'cue-negated' : ''}}">{{tokenPart.text}}</text><text wx:if="{{!segment.cueTokens.length}}">{{segment.corrected_text || segment.text || '…'}}</text></view>
         <view class="segment-meta">
           <text>{{segment.seconds}}s</text>
           <text wx:if="{{!segment.final}}" class="partial-label">实时字幕 · 待确认</text>
-          <text wx:if="{{segment.emotionText}}" class="emotion-label">{{segment.emotionText}}</text>
-          <text wx:if="{{segment.emotion && segment.emotion.event}}">{{segment.emotion.event}}</text>
+          <text wx:if="{{segment.emotionText}}" class="emotion-label">声音 · {{segment.emotionText}}</text>
+          <text wx:if="{{segment.cueCount}}">文字 · {{segment.cueCount}} 处线索</text>
+          <text wx:if="{{segment.final}}" class="source-tag">{{segment.corrected_text ? '校对版' : '原始 ASR'}}</text>
+        </view>
+        <view wx:if="{{segment.final}}" class="history-actions">
+          <button class="quiet history-action" data-key="{{segment.key}}" bindtap="openCorrection" disabled="{{historyEditor.saving}}">校对</button>
+          <button wx:if="{{segment.corrected_text}}" class="quiet history-action" data-key="{{segment.key}}" bindtap="toggleOriginal">{{segment.originalOpen ? '收起原文' : '对照原文'}}</button>
+          <button class="quiet history-action" data-key="{{segment.key}}" data-source="original" bindtap="displayHistory" loading="{{historyDisplayPending && historyDisplayKey === segment.key && historyDisplaySource === 'original'}}" disabled="{{!connected || !historyDisplaySupported || historyDisplayPending || state === 'offline' || state === 'recording' || state === 'processing'}}">推送原始</button>
+          <button class="quiet history-action" data-key="{{segment.key}}" data-source="corrected" bindtap="displayHistory" loading="{{historyDisplayPending && historyDisplayKey === segment.key && historyDisplaySource === 'corrected'}}" disabled="{{!segment.corrected_text || !connected || !historyDisplaySupported || historyDisplayPending || state === 'offline' || state === 'recording' || state === 'processing'}}">推送校对</button>
+        </view>
+        <view wx:if="{{segment.originalOpen && segment.corrected_text}}" class="original-comparison"><view class="caption">原始识别文字 · 保留不变</view><text user-select>{{segment.text}}</text></view>
+        <view wx:if="{{historyDisplayKey === segment.key && historyDisplayStatus}}" class="quality-note">{{historyDisplayStatus}}</view>
+        <view wx:if="{{segment.qualityNote}}" class="quality-note">{{segment.qualityNote}}</view>
+        <button class="emotion-toggle" data-key="{{segment.key}}" bindtap="toggleEmotionDetails" aria-expanded="{{segment.detailsOpen}}">情绪详情 <text>{{segment.detailsOpen ? '收起' : '展开'}}</text></button>
+        <view wx:if="{{segment.detailsOpen}}" class="emotion-details">
+          <view class="detail-heading"><text class="source-tag">声音模型</text><text>{{segment.emotionText || '等待声音分析'}}</text></view>
+          <view wx:if="{{segment.emotion && segment.emotion.event}}" class="detail-copy">声音事件：{{segment.emotion.event}}</view>
+          <view wx:if="{{segment.qualityDetail}}" class="detail-copy">音频测量：{{segment.qualityDetail}}</view>
+          <view wx:if="{{segment.candidateText}}" class="detail-copy">参考候选：{{segment.candidateText}}（未校准，供参考；不是置信率）</view>
+          <view class="detail-heading text-source"><text class="source-tag">文字规则</text><text>{{segment.cueCount ? '词语、否定与程度' : '未找到词典内的明确线索'}}</text></view>
+          <view wx:for="{{segment.detailCues}}" wx:for-item="cue" wx:key="start" class="cue-detail">
+            <view>“{{cue.text}}” · {{cue.label}}词</view>
+            <view class="detail-copy">{{cue.negation}} · 程度{{cue.degree}}</view>
+            <view class="detail-copy">{{cue.reason}}</view>
+          </view>
+          <view wx:if="{{segment.cuesLimited}}" class="detail-copy">{{segment.cueLimitNote}}</view>
+          <view class="detail-note">声音情绪来自原录音；文字线索分析当前显示的{{segment.corrected_text ? '校对版' : '识别文字'}}，不会改写声音标签。{{!segment.final ? '实时字幕仍会修订。' : ''}}</view>
         </view>
       </view>
     </view>
-    <view wx:if="{{groups.length}}" class="footnote">情绪标签来自本地语音模型，可能晚于字幕到达；未返回标签时不推断情绪。</view>
+    <view wx:if="{{groups.length}}" class="footnote">声音标签来自本地语音模型；高亮来自本地文字规则。它们是参考线索，不用于判断心理状态。</view>
   </view>
 
   <view wx:if="{{tab === 'settings'}}">
@@ -136,6 +162,22 @@
       <button class="quiet" bindtap="restoreApplied" disabled="{{!appliedKnown || pending || !draftDirty}}">恢复设备当前设置</button>
     </view>
     <view class="footnote">修改先保留为草稿。只有收到开发板确认，才会显示已应用；确认后的设置由开发板保存。</view>
+  </view>
+
+  <view wx:if="{{historyEditor}}" class="correction-mask" catchtap="closeCorrection">
+    <view class="correction-panel" catchtap="ignoreTap">
+      <view class="panel-heading"><view class="panel-title">校对历史文字</view><button class="quiet small-button" bindtap="closeCorrection" disabled="{{historyEditor.saving}}">关闭</button></view>
+      <view class="caption correction-help">保留原始识别文字。保存到电脑后，可分别推送原始版和校对版。</view>
+      <textarea class="correction-input" value="{{historyEditor.draft}}" maxlength="1024" bindinput="inputCorrection" disabled="{{historyEditor.saving}}" cursor-spacing="40" aria-label="校对文字，最多512字及1536字节" />
+      <view class="caption correction-count">{{historyEditor.counts.characters}} / 512 字 · {{historyEditor.counts.bytes}} / 1536 字节</view>
+      <view class="correction-status {{historyEditor.conflict ? 'conflict' : ''}}" aria-role="status">{{historyEditor.status}}</view>
+      <view class="correction-controls">
+        <button class="primary" bindtap="saveCorrection" loading="{{historyEditor.saving}}" disabled="{{!connected || historyEditor.saving || historyEditor.conflict}}">保存校对</button>
+        <button class="quiet" data-restore="{{true}}" bindtap="saveCorrection" disabled="{{!connected || !historyEditor.hasCorrection || historyEditor.saving || historyEditor.conflict}}">恢复原始</button>
+        <button class="quiet" bindtap="reloadCorrection" disabled="{{historyEditor.saving}}">重新载入</button>
+      </view>
+      <view class="caption">保存与恢复不会自动推送 OLED，声音情绪仍来自原录音。发生版本冲突时先保留草稿，重新载入会替换当前草稿。</view>
+    </view>
   </view>
 
   <view class="bottom-note">ESP32-S3 × INMP441 × FunASR</view>

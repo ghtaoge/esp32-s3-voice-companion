@@ -4,6 +4,11 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from datetime import datetime, timezone
+
+
+class HistoryConflict(ValueError):
+    pass
 
 
 class HistoryStore:
@@ -25,6 +30,7 @@ class HistoryStore:
 
     def upsert(self, event: dict) -> None:
         with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
             previous = self.db.execute("SELECT payload FROM captions WHERE device=? AND recording=? AND segment=?",
                                        (event["device_id"], event["recording_id"], event["segment_id"])).fetchone()
             if previous:
@@ -33,6 +39,11 @@ class HistoryStore:
                     return
                 if previous.get("emotion") and not event.get("emotion"):
                     event = {**event, "emotion": previous["emotion"]}
+                # Delayed ASR/emotion writes cannot erase a newer manual edit,
+                # including a null correction that restored the original.
+                if previous.get("edit_version", 0) >= event.get("edit_version", 0):
+                    event = {**event, **{name: previous[name] for name in
+                             ("edit_version", "corrected_text", "corrected_at") if name in previous}}
             self.db.execute(
                 "INSERT INTO captions(device,recording,segment,payload) VALUES(?,?,?,?) "
                 "ON CONFLICT(device,recording,segment) DO UPDATE SET payload=excluded.payload",
@@ -43,6 +54,29 @@ class HistoryStore:
                 "(SELECT created FROM captions WHERE device=? ORDER BY created DESC LIMIT ?)",
                 (event["device_id"], event["device_id"], self.limit),
             )
+
+    def correct(self, seed: dict, expected_version: int, text: str | None) -> dict:
+        """Commit before acknowledging; original ASR text stays immutable."""
+        with self.lock, self.db:
+            # Serialize the read/version-check/write across SQLite connections,
+            # not only threads sharing this HistoryStore instance.
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute("SELECT payload FROM captions WHERE device=? AND recording=? AND segment=?",
+                                  (seed["device_id"], seed["recording_id"], seed["segment_id"])).fetchone()
+            event = json.loads(row[0]) if row else dict(seed)
+            if event.get("edit_version", 0) != expected_version:
+                raise HistoryConflict("history version changed")
+            event.update(edit_version=expected_version + 1, corrected_text=text,
+                         corrected_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
+            self.db.execute(
+                "INSERT INTO captions(device,recording,segment,payload) VALUES(?,?,?,?) "
+                "ON CONFLICT(device,recording,segment) DO UPDATE SET payload=excluded.payload",
+                (event["device_id"], event["recording_id"], event["segment_id"], json.dumps(event, ensure_ascii=False)),
+            )
+            self.db.execute("DELETE FROM captions WHERE device=? AND created NOT IN "
+                            "(SELECT created FROM captions WHERE device=? ORDER BY created DESC LIMIT ?)",
+                            (event["device_id"], event["device_id"], self.limit))
+            return event
 
     def history(self, device_id: str) -> list[dict]:
         with self.lock:

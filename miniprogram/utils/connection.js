@@ -7,8 +7,8 @@ class Connection {
     this.wx = options.wx;
     this.onState = options.onState || function () {};
     this.onMessage = options.onMessage || function () {};
-    this.setTimeout = options.setTimeout || setTimeout;
-    this.clearTimeout = options.clearTimeout || clearTimeout;
+    this.setTimeout = options.setTimeout || ((fn,ms) => setTimeout(fn,ms));
+    this.clearTimeout = options.clearTimeout || (id => clearTimeout(id));
     this.random = options.random || Math.random;
     this.now = options.now || Date.now;
     this.foreground = false;

@@ -40,12 +40,12 @@ async def run(args):
     pcm = wave.astype("<i2").tobytes()
     if not pcm or len(pcm)>60*32000:
         raise ValueError("Audio must be 0..60 seconds")
-    config = Config(token=secrets.token_urlsafe(24), asr_threads=args.threads,
+    config = Config(token="" if args.local_token else secrets.token_urlsafe(24), asr_threads=args.threads,
                     emotion_enabled=not args.no_emotion, allowed_devices={"perf-s3"})
     app = create_app(config)
     hub = app.state.hub
     listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
+    listener.bind(("127.0.0.1", args.port))
     port = listener.getsockname()[1]
     server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False,
         ws="websockets", ws_max_size=8192, ws_max_queue=8, ws_per_message_deflate=False))
@@ -66,12 +66,16 @@ async def run(args):
                     await asyncio.sleep(.05)
             if hub.emotion.state != "ready":
                 raise RuntimeError("Real emotion model did not become ready")
+        if args.startup_delay:
+            print(f"Ready on 127.0.0.1:{port}; waiting {args.startup_delay}s for optional PC subscriber", flush=True)
+            await asyncio.sleep(args.startup_delay)
         ready, done, captions, emotions = {}, {}, {}, {}
         ping_sent, pings, jitters, memory = deque(), [], [], []
         process = psutil.Process()
         current_id = [None]
         root_url = f"ws://127.0.0.1:{port}/ws"
         async with connect(f"{root_url}/device/perf-s3?token={config.token}", compression=None) as board, connect(f"{root_url}/client/perf-s3?token={config.token}", compression=None, max_size=512*1024) as phone:
+            client_count = sum(peer.role == "client" for peer in hub.peers)
             async def receive(ws, role):
                 async for raw in ws:
                     event = json.loads(raw)
@@ -152,6 +156,7 @@ async def run(args):
             if args.expected_text:
                 assert all(text == args.expected_text for text in left.values()), f"Transcription changed: {list(left.values())}"
             results = {"audio_ms_per_round":len(pcm)/32,"rounds":rounds,"emotion_enabled":not args.no_emotion,
+                "client_subscribers":client_count,
                 "threads":args.threads,"same_final_on_both_clients":True,"completed_emotions":len(emotions),
                 "texts":list(left.values()),
                 "parent_cpu_one_core_pct":round(paced_cpu,1),
@@ -184,4 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("--long",action="store_true")
     parser.add_argument("--expected-text",default="")
     parser.add_argument("--output",type=Path,default=ROOT/".local/gateway-stress.json")
+    parser.add_argument("--port",type=int,default=0,help="Use a fixed isolated benchmark port for a PC subscriber; default chooses an available port")
+    parser.add_argument("--local-token",action="store_true",help="Use the existing local pairing token so the independent PC console can subscribe; never printed")
+    parser.add_argument("--startup-delay",type=float,default=0,help="Pause after model warmup for an optional browser subscriber")
     asyncio.run(run(parser.parse_args()))

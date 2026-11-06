@@ -1,12 +1,54 @@
 'use strict';
 
 const protocol = require('../../utils/protocol');
+const emotionCues = require('../../utils/emotion-cues');
 const { Connection } = require('../../utils/connection');
 const STORAGE_KEY = 'voice-companion.connection.v1';
 const FONT_OPTIONS = ['标准 · 1 倍', '大字 · 2 倍', '特大 · 3 倍', '超大 · 4 倍'];
 const MODE_KEYS = ['page', 'scroll', 'typewriter', 'static'];
 const MODE_OPTIONS = MODE_KEYS.map(key => protocol.MODES[key]);
 const CONNECTION_NAMES = { disconnected:'未连接电脑', connecting:'正在连接电脑', connected:'电脑已连接', reconnecting:'正在重连电脑', paused:'已暂停连接', rejected:'配对未通过' };
+const MAX_VISIBLE_CUES = 16;
+function requestId() { return 'mini-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8); }
+function textCounts(text) {
+  let characters=0,bytes=0;
+  for(const char of text){const cp=char.codePointAt(0);characters++;bytes+=cp<0x80?1:cp<0x800?2:cp<0x10000?3:4;}
+  return {characters,bytes};
+}
+
+function cueView(text, analysis) {
+  const tokens=[],cues=analysis.cues.slice(0,MAX_VISIBLE_CUES);
+  // Plain sentences use the original caption directly; do not duplicate the
+  // entire text in a second setData token string on every streaming revision.
+  if(!cues.length)return {tokens,cues};
+  let cursor=0;
+  cues.forEach(cue=>{
+    if(cue.start>cursor)tokens.push({text:text.slice(cursor,cue.start),start:cursor,highlight:false});
+    tokens.push({text:cue.text,start:cue.start,highlight:true,negated:cue.negated});cursor=cue.end;
+  });
+  if(cursor<text.length)tokens.push({text:text.slice(cursor),start:cursor,highlight:false});
+  return {tokens,cues};
+}
+function audioQuality(quality) {
+  if(!quality || typeof quality!=='object')return {note:'',detail:''};
+  const notes=[],parts=[];
+  if(quality.reason==='short_context' || quality.reason==='below_feature_window')notes.push('片段较短');
+  if(quality.reason==='no_audio')notes.push('没有可分析的声音');
+  if(quality.reason==='no_signal')notes.push('未检测到有效音频信号');
+  if(quality.reason==='truncated')notes.push('长句仅分析部分');
+  if(Number.isFinite(quality.clipping_ratio) && quality.clipping_ratio>0.001)notes.push('声音可能过载');
+  if(Number.isFinite(quality.duration_ms))parts.push('送入片段 '+(quality.duration_ms/1000).toFixed(2)+' 秒');
+  if(Number.isFinite(quality.analyzed_ms))parts.push('分析 '+(quality.analyzed_ms/1000).toFixed(2)+' 秒');
+  if(Number.isFinite(quality.peak))parts.push('峰值 '+(quality.peak*100).toFixed(1)+'%');
+  if(Number.isFinite(quality.rms_dbfs))parts.push('RMS '+quality.rms_dbfs.toFixed(1)+' dBFS');
+  if(Number.isFinite(quality.clipping_ratio))parts.push('削波比例 '+(quality.clipping_ratio*100).toFixed(2)+'%');
+  return {note:notes.join(' · '),detail:parts.join(' · ')};
+}
+function candidateText(emotion) {
+  if(!emotion || !Array.isArray(emotion.candidates))return '';
+  return emotion.candidates.slice(0,3).filter(item=>item && Object.prototype.hasOwnProperty.call(protocol.EMOTIONS,item.label) && Number.isFinite(item.score))
+    .map(item=>protocol.EMOTIONS[item.label]+' '+item.score.toFixed(2)).join(' / ');
+}
 
 Page({
   data: {
@@ -18,7 +60,9 @@ Page({
     draft:Object.assign({}, protocol.DEFAULT_SETTINGS), applied:Object.assign({}, protocol.DEFAULT_SETTINGS),
     appliedKnown:false, draftDirty:false, pending:false, settingsStatus:'连接后读取设备设置',
     draftPageSeconds:'3.0', appliedSummary:'尚未读取设备设置',
-    showPrivacy:false, privacyName:'《用户隐私保护指引》'
+    showPrivacy:false, privacyName:'《用户隐私保护指引》',
+    historyEditor:null, historyDisplaySupported:false, historyDisplayHint:'',
+    historyDisplayKey:'',historyDisplaySource:'',historyDisplayPending:false,historyDisplayStatus:''
   },
   onLoad() {
     this.unloaded = false;
@@ -32,6 +76,9 @@ Page({
     this.renderDirty = false;
     this.level = 0;
     this.buildGroups = protocol.groupBuilder();
+    this.cueCache=new Map();this.cueViews=new Map();this.cueGroups=new Map();this.expandedEmotionKey=null;
+    this.expandedOriginalKey=null;this.correctionRequest=null;this.correctionTimer=null;
+    this.historyDisplayRequest=null;this.historyDisplayTimer=null;
     this.privacyResolvers = [];
     this.connection = new Connection({ wx,
       onState:(name, delay) => this.connectionChanged(name, delay),
@@ -66,6 +113,8 @@ Page({
     clearTimeout(this.renderTimer); this.renderTimer=null; this.renderDirty=false;
     if (this.connection) this.connection.setForeground(false);
     this.finishPending('页面已暂停；重新连接后读取实际设置');
+    this.finishCorrection('页面已暂停，保存结果未知；重连后重新载入确认',true);
+    this.finishHistoryDisplay('页面已暂停，推送结果未知');
     this.settlePrivacy('disagree');
   },
   onUnload() {
@@ -74,8 +123,10 @@ Page({
     this.foreground = false;
     if (this.connection) this.connection.destroy();
     clearTimeout(this.pendingTimer); clearTimeout(this.renderTimer);
+    clearTimeout(this.correctionTimer);clearTimeout(this.historyDisplayTimer);
     this.settlePrivacy('disagree');
     if (wx.offNeedPrivacyAuthorization && this.privacyHandler) wx.offNeedPrivacyAuthorization(this.privacyHandler);
+    this.cueCache.clear();this.cueViews.clear();this.cueGroups.clear();
   },
   connectionChanged(name, delay) {
     if (this.unloaded) return;
@@ -97,6 +148,10 @@ Page({
       update.level = 0;
       update.stateTitle = '等待连接电脑';
       this.finishPending('连接中断；重连后读取设备实际设置');
+      this.finishCorrection('连接中断，保存结果未知；重连后重新载入确认',true);
+      this.finishHistoryDisplay('连接中断，推送结果未知');
+      if(this.state.capabilities.length)this.state=Object.assign({},this.state,{capabilities:[]});
+      this.scheduleRender();
     }
     if (name === 'rejected') { update.errorText='配对未通过，请检查设备标识和口令后重新连接'; update.showConnection=true; }
     this.setData(update);
@@ -143,14 +198,31 @@ Page({
         protocol:'开发板协议版本不兼容，请更新服务与固件',
         unsupported:'当前服务不支持这项操作，请检查客户端版本',
         invalid_json:'消息格式不正确，请检查客户端版本',
-        unauthorized:'配对失败，请检查设备标识和配对口令'
+        unauthorized:'配对失败，请检查设备标识和配对口令',
+        history_conflict:'这句话已在另一端修改，草稿已保留；请重新载入后再保存',
+        history_invalid:'校对需为非空文字，最多 512 字且 UTF-8 不超过 1536 字节',
+        history_not_found:'这条记录已不在电脑历史中，请刷新历史',
+        history_not_final:'实时字幕仍在修订，请等最终文字后校对',
+        history_save_failed:'校对尚未保存到电脑，草稿已保留，请重试',
+        display_busy:'开发板正在录音或整理字幕，请完成后再推送',
+        display_unsupported:'当前开发板固件不支持历史推送，请升级固件',
+        display_too_long:'这段文字超过 OLED 的 1536 字节上限，请保存较短的校对版后推送',
+        display_timeout:'等待 OLED 确认超时，推送结果未知',
+        display_rejected:'开发板未应用这次历史推送，请重试',
+        display_conflict:'校对版本已更新，请重新载入后再推送'
       };
-      this.setData({errorText:publicMessages[message.code] || '服务返回错误（' + protocol.boundedText(message.code,40) + '），请查看电脑状态'});
+      const displayConflict=message.code==='history_conflict' && this.historyDisplayRequest && message.request_id===this.historyDisplayRequest.id;
+      const errorText=displayConflict?'校对版本已更新，已请求最新历史；确认后请重新推送':
+        publicMessages[message.code] || '服务返回错误（' + protocol.boundedText(message.code,40) + '），请查看电脑状态';
+      this.setData({errorText});
       if (message.request_id && message.request_id === this.pendingRequest) this.finishPending('设备未应用这次设置');
+      if(this.correctionRequest && message.request_id===this.correctionRequest.id)this.finishCorrection(errorText,message.code==='history_conflict');
+      if(this.historyDisplayRequest && message.request_id===this.historyDisplayRequest.id)this.finishHistoryDisplay(errorText);
       return;
     }
     const previousState=this.state;
     this.state = protocol.reduce(this.state, message);
+    this.receiveHistoryResult(message);
     if (message.type === 'settings_pending' && message.request_id === this.pendingRequest) this.setData({settingsStatus:'电脑已转发，等待开发板确认…'});
     if (message.type === 'settings_applied' && message.request_id === this.pendingRequest) {
       try {
@@ -171,6 +243,155 @@ Page({
     if(this.unloaded||!this.foreground||this.renderTimer||this.renderInFlight)return;
     this.renderTimer=setTimeout(()=>{this.renderTimer=null;this.renderDirty=false;this.renderState();},80);
   },
+  emotionGroups(groups) {
+    const nextCache=new Map(),nextViews=new Map(),nextGroups=new Map();
+    const decorated=groups.map(group=>{
+      const segments=group.segments.map(segment=>{
+        const displayed=protocol.displayText(segment);
+        let lexical=this.cueCache.get(segment.key);
+        if(!lexical || lexical.text!==displayed){
+          const analysis=emotionCues.analyze(displayed);
+          lexical=Object.assign({text:displayed,analysis},cueView(displayed,analysis));
+        }
+        nextCache.set(segment.key,lexical);
+        const detailsOpen=this.expandedEmotionKey===segment.key,originalOpen=this.expandedOriginalKey===segment.key,old=this.cueViews.get(segment.key);
+        if(old && old.source===segment && old.open===detailsOpen && old.originalOpen===originalOpen){nextViews.set(segment.key,old);return old.view;}
+        const quality=audioQuality(segment.emotion && segment.emotion.audio_quality);
+        const detailCues=detailsOpen?lexical.cues.map(cue=>({start:cue.start,text:cue.text,label:cue.labelText,
+          negation:emotionCues.NEGATIONS[cue.negation],degree:emotionCues.DEGREES[cue.degree],reason:cue.reason})):[];
+        const view=Object.assign({},segment,{cueTokens:lexical.tokens,cueCount:lexical.analysis.cues.length,
+          cuesLimited:lexical.analysis.truncated || lexical.analysis.cues.length>MAX_VISIBLE_CUES,
+          cueLimitNote:lexical.analysis.truncated || lexical.analysis.cues.length>MAX_VISIBLE_CUES?
+            (displayed.length>lexical.analysis.text.length?'长字幕仅分析开头，完整字幕保留。':'仅高亮和展开前 16 处线索，完整字幕保留。'):'',
+          detailsOpen,originalOpen,detailCues,qualityNote:quality.note,qualityDetail:detailsOpen?quality.detail:'',
+          candidateText:detailsOpen?candidateText(segment.emotion):''});
+        nextViews.set(segment.key,{source:segment,open:detailsOpen,originalOpen,view});return view;
+      });
+      const old=this.cueGroups.get(group.id);
+      const view=old && old.source===group && old.view.segments.every((segment,n)=>segment===segments[n])?old.view:Object.assign({},group,{segments});
+      nextGroups.set(group.id,{source:group,view});return view;
+    });
+    this.cueCache=nextCache;this.cueViews=nextViews;this.cueGroups=nextGroups;
+    if(this.expandedEmotionKey && !nextCache.has(this.expandedEmotionKey))this.expandedEmotionKey=null;
+    if(this.expandedOriginalKey && !nextCache.has(this.expandedOriginalKey))this.expandedOriginalKey=null;
+    return decorated;
+  },
+  emotionPatch(previous,next) {
+    const patch=protocol.groupPatch(previous,next);
+    if(patch.groups)return patch;
+    next.forEach((group,index)=>{
+      if(patch['groups['+index+'].segments'])return;
+      group.segments.forEach((segment,n)=>{
+      const old=previous[index].segments[n];
+      if(old && old.key===segment.key && (old.detailsOpen!==segment.detailsOpen || old.originalOpen!==segment.originalOpen || old.qualityNote!==segment.qualityNote || old.qualityDetail!==segment.qualityDetail || old.candidateText!==segment.candidateText))
+        patch['groups['+index+'].segments['+n+']']=segment;
+      });
+    });
+    return patch;
+  },
+  toggleEmotionDetails(event) {
+    const key=event.currentTarget.dataset.key;
+    if(!this.state.segments.some(segment=>segment.key===key))return;
+    this.expandedEmotionKey=this.expandedEmotionKey===key?null:key;this.scheduleRender();
+  },
+  toggleOriginal(event) {
+    const key=event.currentTarget.dataset.key;
+    if(!this.state.segments.some(segment=>segment.key===key && segment.corrected_text!==null))return;
+    this.expandedOriginalKey=this.expandedOriginalKey===key?null:key;this.scheduleRender();
+  },
+  historySegment(event) {return this.state.segments.find(segment=>segment.key===event.currentTarget.dataset.key);},
+  openCorrection(event) {
+    const segment=this.historySegment(event);
+    if(!segment || !segment.final || this.correctionRequest)return;
+    const draft=protocol.displayText(segment);
+    this.setData({historyEditor:{key:segment.key,recordingId:segment.recording_id,segmentId:segment.segment_id,
+      version:segment.edit_version,original:segment.text,draft,hasCorrection:segment.corrected_text!==null,
+      counts:textCounts(draft),saving:false,conflict:false,status:'保存仅更新历史，推送到 OLED 需另行选择版本。'}});
+  },
+  inputCorrection(event) {
+    const editor=this.data.historyEditor;
+    if(!editor || editor.saving)return;
+    const draft=event.detail.value;
+    this.setData({'historyEditor.draft':draft,'historyEditor.counts':textCounts(draft)});
+  },
+  closeCorrection() {if(!this.correctionRequest)this.setData({historyEditor:null});},
+  reloadCorrection() {
+    const editor=this.data.historyEditor;if(!editor || this.correctionRequest)return;
+    const segment=this.state.segments.find(item=>item.key===editor.key);
+    if(!segment){this.setData({'historyEditor.status':'记录已移出当前历史，请关闭后刷新'});return;}
+    const draft=protocol.displayText(segment);
+    this.setData({historyEditor:Object.assign({},editor,{version:segment.edit_version,original:segment.text,draft,
+      hasCorrection:segment.corrected_text!==null,counts:textCounts(draft),conflict:false,status:'已重新载入电脑保存的最新版本。'})});
+  },
+  saveCorrection(event) {
+    const editor=this.data.historyEditor;
+    if(!editor || this.correctionRequest || !this.data.connected)return;
+    if(editor.conflict){this.setData({'historyEditor.status':'请先重新载入最新版本，再调整草稿并保存'});return;}
+    let text;
+    try{text=protocol.validateCorrection(event && event.currentTarget && event.currentTarget.dataset.restore?null:editor.draft);}
+    catch(error){this.setData({'historyEditor.status':error.message});return;}
+    const id=requestId(),request={id,key:editor.key,recordingId:editor.recordingId,segmentId:editor.segmentId,version:editor.version,text};
+    this.correctionRequest=request;
+    this.setData({'historyEditor.saving':true,'historyEditor.status':'正在保存到电脑历史…',errorText:''});
+    this.correctionTimer=setTimeout(()=>{if(this.correctionRequest===request)this.finishCorrection('保存确认超时，结果未知；请重新载入确认',true);},12000);
+    this.connection.send({type:'history_correct',request_id:id,recording_id:request.recordingId,segment_id:request.segmentId,
+      expected_edit_version:request.version,text}).catch(()=>{if(this.correctionRequest===request)this.finishCorrection('发送失败，草稿已保留；重连后重新载入确认',true);});
+  },
+  finishCorrection(status,conflict) {
+    if(!this.correctionRequest)return;
+    clearTimeout(this.correctionTimer);this.correctionTimer=null;this.correctionRequest=null;
+    if(!this.unloaded && this.data.historyEditor)this.setData({'historyEditor.saving':false,'historyEditor.status':status,
+      'historyEditor.conflict':Boolean(conflict)});
+  },
+  displayHistory(event) {
+    const segment=this.historySegment(event),source=event.currentTarget.dataset.source;
+    if(!segment || !segment.final || this.historyDisplayRequest || !this.data.connected)return;
+    if(!this.state.capabilities.includes('history_display')){this.setData({errorText:'当前开发板固件不支持历史推送，请升级固件'});return;}
+    if(this.state.state==='offline' || this.state.state==='recording' || this.state.state==='processing'){
+      this.setData({errorText:'请等待开发板在线且录音处理完成，再推送历史文字'});return;
+    }
+    if(source!=='original' && source!=='corrected' || source==='corrected' && segment.corrected_text===null)return;
+    const text=source==='corrected'?segment.corrected_text:segment.text;
+    if(textCounts(text).bytes>1536){this.setData({errorText:'这段文字超过 OLED 的 1536 字节上限，请保存较短校对版后推送'});return;}
+    const id=requestId(),request={id,key:segment.key,recordingId:segment.recording_id,segmentId:segment.segment_id,source,version:segment.edit_version};
+    this.historyDisplayRequest=request;
+    this.setData({historyDisplayKey:segment.key,historyDisplaySource:source,historyDisplayPending:true,historyDisplayStatus:'正在请求推送…',errorText:''});
+    this.historyDisplayTimer=setTimeout(()=>{if(this.historyDisplayRequest===request)this.finishHistoryDisplay('OLED 确认超时，推送结果未知');},12000);
+    const message={type:'history_display',request_id:id,recording_id:segment.recording_id,segment_id:segment.segment_id,source};
+    if(source==='corrected')message.expected_edit_version=segment.edit_version;
+    this.connection.send(message).catch(()=>{if(this.historyDisplayRequest===request)this.finishHistoryDisplay('发送失败，请重连后重试');});
+  },
+  finishHistoryDisplay(status) {
+    if(!this.historyDisplayRequest)return;
+    clearTimeout(this.historyDisplayTimer);this.historyDisplayTimer=null;this.historyDisplayRequest=null;
+    if(!this.unloaded)this.setData({historyDisplayPending:false,historyDisplayStatus:status});
+  },
+  receiveHistoryResult(message) {
+    const correction=this.correctionRequest;
+    if(message.type==='history_corrected' && correction && message.request_id===correction.id &&
+        message.recording_id===correction.recordingId && message.segment_id===correction.segmentId){
+      const saved=this.state.segments.find(item=>item.key===correction.key);
+      if(saved && saved.edit_version===message.edit_version && saved.edit_version>correction.version && saved.corrected_text===correction.text){
+        this.finishCorrection(correction.text===null?'已恢复原始文字，尚未推送 OLED':'校对已保存，尚未推送 OLED');
+        if(this.data.historyEditor)this.setData({'historyEditor.version':saved.edit_version,'historyEditor.draft':protocol.displayText(saved),
+          'historyEditor.counts':textCounts(protocol.displayText(saved)),'historyEditor.hasCorrection':saved.corrected_text!==null});
+      }else this.finishCorrection('保存确认不完整；草稿已保留，请重新载入确认',true);
+    }
+    const editor=this.data.historyEditor;
+    if(editor && !this.correctionRequest){
+      const current=this.state.segments.find(item=>item.key===editor.key);
+      if(current && current.edit_version!==editor.version && !editor.conflict)
+        this.setData({'historyEditor.conflict':true,'historyEditor.status':'电脑保存的版本已更新，草稿已保留；请重新载入后再保存'});
+    }
+    const display=this.historyDisplayRequest;
+    if(display && message.request_id===display.id){
+      if(message.type==='display_pending')this.setData({historyDisplayStatus:'电脑已转发，等待 OLED 应用确认…'});
+      if(message.type==='history_displayed' && message.recording_id===display.recordingId && message.segment_id===display.segmentId && message.source===display.source){
+        this.finishHistoryDisplay(display.source==='corrected' && message.edit_version!==display.version?
+          'OLED 返回的校对版本不同，请重新载入后确认':'OLED 已确认显示'+(display.source==='corrected'?'校对版':'原始版'));
+      }
+    }
+  },
   renderState() {
     if (this.unloaded || !this.foreground) return;
     if(this.renderInFlight){this.renderDirty=true;return;}
@@ -188,11 +409,13 @@ Page({
       message='请在电脑检查本地模型与服务状态；修复模型后重启服务，再重新连接。';
     }
     const s = state.settings;
-    const patch=protocol.groupPatch(this.data.groups,this.buildGroups(state));
+    const patch=this.emotionPatch(this.data.groups,this.emotionGroups(this.buildGroups(state)));
     const fields={state:state.state, stateTitle:title, stateMessage:message, ready:state.ready,
       lastTiming:timing, applied:Object.assign({},s), appliedKnown:state.settings_known,
       appliedSummary:state.settings_known ? s.font_scale + ' 倍字号 · ' + protocol.MODES[s.display_mode] + ' · 亮度 ' + s.brightness : '尚未读取设备设置',
-      level:state.state === 'recording' ? this.level : 0};
+      level:state.state === 'recording' ? this.level : 0,
+      historyDisplaySupported:state.capabilities.includes('history_display'),
+      historyDisplayHint:this.data.connected && state.state!=='offline' && !state.capabilities.includes('history_display')?'开发板需要升级固件，才能推送历史文字到 OLED。':''};
     Object.keys(fields).forEach(key=>{
       if(key==='applied'){
         if(Object.keys(s).some(name=>this.data.applied[name]!==s[name]))patch.applied=fields.applied;
@@ -225,7 +448,8 @@ Page({
     catch (error) { this.setData({errorText:error.message}); return; }
     if (!this.connectionInfo || this.connectionInfo.device_id !== info.device_id || this.connectionInfo.url !== info.url) {
       this.state=protocol.initialState(info.device_id);
-      this.setData({groups:[], level:0, appliedKnown:false, draftDirty:false, lastTiming:''});
+      this.finishCorrection('连接目标已更换');this.finishHistoryDisplay('连接目标已更换');
+      this.setData({groups:[], level:0, appliedKnown:false, draftDirty:false, lastTiming:'',historyEditor:null,historyDisplayKey:'',historyDisplayStatus:''});
     }
     this.connectionInfo=info;
     this.setData({address:info.url,deviceId:info.device_id,token:info.token,errorText:'',notice:''});

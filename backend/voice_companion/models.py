@@ -243,10 +243,12 @@ EVENTS = {
 
 
 class EmotionRecognizer:
-    """SenseVoiceSmall's acoustic tags, without keyword guesses/confidence.
+    """SenseVoiceSmall's utterance tags and uncalibrated acoustic candidates.
 
     Use on the background emotion executor, never on the streaming ASR thread.
-    Analysis is bounded to the first 15 seconds of the supplied segment.
+    Analysis is bounded to the first 15 seconds of the supplied segment. A
+    candidate score is a raw model output at emotion-prefix frame 1, not a
+    probability/confidence and never a replacement for native EMO_UNKNOWN.
     """
 
     max_samples = 15 * SAMPLE_RATE
@@ -257,18 +259,85 @@ class EmotionRecognizer:
                                      str(directory), quantize=True, batch_size=1,
                                      intra_op_num_threads=max(1, threads))
         self.model.frontend.opts.frame_opts.dither = 0.0
+        # The official SenseVoice input prefixes are language/emotion/event/ITN.
+        # Resolve the seven known emotion IDs from the shipped tokenizer; do
+        # not assume that another checkpoint preserves numerical token IDs.
+        self._emotion_ids = []
+        for tag, label in EMOTIONS.items():
+            if label == "unknown":
+                continue
+            piece = f"<|{tag}|>"
+            token = self.model.tokenizer.sp.piece_to_id(piece)
+            if self.model.tokenizer.sp.id_to_piece(token) != piece:
+                raise ModelUnavailableError(f"SenseVoice tokenizer is missing {piece}")
+            self._emotion_ids.append((label, token))
+
+    def _quality(self, audio: np.ndarray, analyzed_samples: int) -> dict:
+        """Measurements of analyzed PCM, calculated only in the SER process.
+
+        duration_ms describes the input; the other measurements describe its
+        analyzed prefix (analyzed_ms), so truncation remains explicit.
+        clipping_ratio counts exact PCM16 digital-rail samples. It signals risk;
+        it cannot prove analog clipping or determine a person's emotion.
+        short_context is an informational duration flag, never a label gate.
+        """
+        count = audio.size
+        analyzed = audio[:analyzed_samples]
+        peak = float(np.max(np.abs(analyzed))) if analyzed_samples else 0.0
+        power = float(np.mean(analyzed.astype(np.float64) ** 2)) if analyzed_samples else 0.0
+        clipping = float(np.mean((analyzed >= 32767 / 32768) | (analyzed <= -1))) if analyzed_samples else 0.0
+        if not count:
+            reason = "no_audio"
+        elif analyzed_samples < 400:
+            reason = "below_feature_window"
+        elif not peak:
+            reason = "no_signal"
+        elif count > self.max_samples:
+            reason = "truncated"
+        elif analyzed_samples < SAMPLE_RATE:
+            reason = "short_context"
+        else:
+            reason = None
+        return {"duration_ms": count * 1000 / SAMPLE_RATE,
+                "analyzed_ms": analyzed_samples * 1000 / SAMPLE_RATE,
+                "peak": peak, "rms_dbfs": float(10 * np.log10(power)) if power > 0 else None,
+                "clipping_ratio": clipping, "reason": reason}
 
     def analyze(self, pcm: bytes) -> dict:
-        audio = _waveform(pcm)[:self.max_samples]
-        # No 25 ms fbank frame can be formed. Unknown is the absence of a
-        # model label here, not a guessed neutral emotion for a short click.
-        if audio.size < 400:
-            return {"label": "unknown", "event": "unknown", "raw_tags": []}
-        output = self.model(audio, language="auto", textnorm="woitn")
-        if not output or not isinstance(output[0], str):
-            raise RuntimeError("Unexpected SenseVoice output")
-        raw_tags = re.findall(r"<\|[^|>]+\|>", output[0])
+        supplied = _waveform(pcm)
+        audio = supplied[:self.max_samples]
+        quality = self._quality(supplied, audio.size)
+        if audio.size < 400 or not quality["peak"]:
+            return {"label": "unknown", "event": "unknown", "raw_tags": [],
+                    "candidates": [], "audio_quality": quality}
+        # Match the official ONNX greedy CTC decoder, but retain only seven
+        # scalar scores from this SAME forward. No second model call and no
+        # copy of the large [time,vocabulary] tensor is needed.
+        model = self.model
+        features, lengths = model.extract_feat([audio])
+        logits, output_lengths = model.infer(features, lengths,
+            np.array([model.lid_dict["auto"]], dtype=np.int32),
+            np.array([model.textnorm_dict["withitn"]], dtype=np.int32))
+        if logits.ndim != 3 or logits.shape[0] != 1:
+            raise RuntimeError("Unexpected SenseVoice logits shape")
+        valid_frames = min(max(int(output_lengths[0]), 0), logits.shape[1])
+        scores = logits[0, :valid_frames, :]  # view, not a full-logits copy
+        if valid_frames:
+            ids = np.argmax(scores, axis=-1)
+            ids = ids[np.concatenate(([True], np.diff(ids) != 0))]
+            raw = model.tokenizer.decode(ids[ids != model.blank_id].tolist())
+        else:
+            raw = ""
+        raw_tags = re.findall(r"<\|[^|>]+\|>", raw)
         names = [token[2:-2].upper() for token in raw_tags]
         label = next((EMOTIONS[name] for name in names if name in EMOTIONS), "unknown")
         event = next((EVENTS[name] for name in names if name in EVENTS), "unknown")
-        return {"label": label, "event": event, "raw_tags": raw_tags}
+        candidates = []
+        if valid_frames > 1:
+            for candidate, token in self._emotion_ids:
+                value = float(scores[1, token])
+                if np.isfinite(value):
+                    candidates.append({"label": candidate, "score": value})
+            candidates.sort(key=lambda item: item["score"], reverse=True)
+        return {"label": label, "event": event, "raw_tags": raw_tags,
+                "candidates": candidates[:3], "audio_quality": quality}

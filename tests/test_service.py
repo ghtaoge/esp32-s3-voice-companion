@@ -159,6 +159,27 @@ def test_settings_wait_for_device_ack(context):
         assert until(phone, "settings_applied")["settings"]["font_scale"] == 3
 
 
+def test_acoustic_quality_and_raw_tags_reach_live_and_reconnected_clients(context):
+    client, hub, _ = context
+    with client.websocket_connect(url("client")) as phone, client.websocket_connect(url()) as board:
+        until(phone, "snapshot")
+        until(board, "snapshot")
+        board.send_json({"type": "record_start", "recording_id": "quality-1"})
+        until(board, "record_ready")
+        board.send_bytes(bytes(640))
+        board.send_json({"type": "record_stop", "recording_id": "quality-1"})
+        until(board, "recording_done")
+        result = {"label": "unknown", "event": "speech", "status": "ready", "raw_tags": ["<|EMO_UNKNOWN|>"], "candidates": [{"label": "sad", "score": -1.2}],
+                  "audio_quality": {"duration_ms": 20, "analyzed_ms": 20, "peak": 0.0, "rms_dbfs": None, "clipping_ratio": 0.0, "reason": "below_feature_window"}}
+        client.portal.call(hub.on_emotion, ("esp32-s3", "quality-1", 0), result)
+        event = until(phone, "emotion")
+        assert event["audio_quality"] == result["audio_quality"]
+        assert event["label"] == "unknown" and event["raw_tags"] == result["raw_tags"]
+    with client.websocket_connect(url("client")) as again:
+        snapshot = until(again, "snapshot")
+        assert snapshot["history"][0]["emotion"] == result
+
+
 def test_settings_invalid_or_offline_not_applied(context):
     client, _, _ = context
     with client.websocket_connect(url("client")) as phone:

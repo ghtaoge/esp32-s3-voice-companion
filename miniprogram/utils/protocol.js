@@ -1,3 +1,7 @@
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.VoiceProtocol = factory();
+})(typeof globalThis === 'object' ? globalThis : this, function () {
 'use strict';
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -35,6 +39,24 @@ function boundedText(value, max) {
   return value.slice(0, end);
 }
 function safeId(value, max) { return typeof value === 'string' && value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value); }
+function validateCorrection(value) {
+  if(value===null)return null;
+  if(typeof value!=='string')throw new Error('校对文字格式不正确');
+  const normalized=value.replace(/\r\n?/g,'\n');
+  if(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/.test(normalized))throw new Error('校对文字不能包含TAB或控制字符，只允许正常换行');
+  const text=normalized.trim();
+  if(!text)throw new Error('校对文字不能为空；恢复原文请使用“恢复原始识别”');
+  let points=0,bytes=0;
+  for(const point of text){
+    const cp=point.codePointAt(0);
+    if(cp===0||(cp>=0xD800&&cp<=0xDFFF))throw new Error('校对文字包含无效字符');
+    points++;bytes+=cp<=0x7F?1:cp<=0x7FF?2:cp<=0xFFFF?3:4;
+    if(points>512||bytes>1536)throw new Error('校对文字最多512个字，UTF-8最多1536字节');
+  }
+  return text;
+}
+function displayText(segment) { return typeof segment.corrected_text==='string'?segment.corrected_text:segment.text; }
+function segmentUnits(segment) {return segment.text.length+(typeof segment.corrected_text==='string'?segment.corrected_text.length:0);}
 
 function validateSettings(value) {
   if (!object(value)) throw new Error('屏幕设置格式不正确');
@@ -101,11 +123,27 @@ function emotionValue(value) {
   if (!object(value)) return null;
   const label = Object.prototype.hasOwnProperty.call(EMOTIONS, value.label) ? value.label : 'unknown';
   const status = ['ready', 'skipped', 'error'].indexOf(value.status) !== -1 ? value.status : 'ready';
-  return { label, status, event: boundedText(value.event, 80) };
+  const result = { label, status, event: boundedText(value.event, 80) };
+  if (Array.isArray(value.raw_tags)) result.raw_tags = value.raw_tags.slice(0,8).filter(tag=>typeof tag==='string').map(tag=>boundedText(tag,40));
+  if (Array.isArray(value.candidates)) {
+    const seen=new Set();
+    result.candidates=value.candidates.slice(0,16).filter(candidate=>{
+      if(!object(candidate)||candidate.label==='unknown'||!Object.prototype.hasOwnProperty.call(EMOTIONS,candidate.label)||!Number.isFinite(candidate.score)||seen.has(candidate.label))return false;
+      seen.add(candidate.label);return true;
+    }).slice(0,3).map(candidate=>({label:candidate.label,score:candidate.score}));
+  }
+  if (object(value.audio_quality)) {
+    const quality = {}, source = value.audio_quality;
+    const ranges = {duration_ms:[0,3600000],analyzed_ms:[0,3600000],peak:[0,8],rms_dbfs:[-180,24],clipping_ratio:[0,1]};
+    Object.keys(ranges).forEach(key=>{const number=source[key];if(Number.isFinite(number)&&number>=ranges[key][0]&&number<=ranges[key][1])quality[key]=number;});
+    if (source.reason === null || ['no_audio','no_signal','below_feature_window','short_context','truncated'].indexOf(source.reason)!==-1) quality.reason=source.reason;
+    if(Object.keys(quality).length)result.audio_quality=quality;
+  }
+  return result;
 }
 function initialState(deviceId) {
   return { device_id: deviceId || '', state: 'offline', recording_id: null, segments: [],
-    text_units:0,
+    text_units:0, capabilities:[],
     pending_emotions: {}, settings: Object.assign({}, DEFAULT_SETTINGS), settings_known: false,
     ready: false, message: '', last_done: null };
 }
@@ -115,33 +153,56 @@ function validSegment(value) {
 }
 function trimHistory(next) {
   while (next.segments.length > MAX_SEGMENTS || next.text_units > MAX_TEXT_UNITS) {
-    next.text_units -= next.segments.shift().text.length;
+    next.text_units -= segmentUnits(next.segments.shift());
   }
+}
+function correctionFields(message,previous) {
+  const fallback=previous?{edit_version:previous.edit_version||0,corrected_text:previous.corrected_text==null?null:previous.corrected_text,corrected_at:previous.corrected_at||null}:{edit_version:0,corrected_text:null,corrected_at:null};
+  if(!integer(message.edit_version,0,Number.MAX_SAFE_INTEGER)||message.edit_version<fallback.edit_version)return fallback;
+  if(previous&&message.edit_version===fallback.edit_version)return fallback;
+  if(message.corrected_text!==null&&typeof message.corrected_text!=='string')return fallback;
+  try{return{edit_version:message.edit_version,corrected_text:validateCorrection(message.corrected_text),corrected_at:typeof message.corrected_at==='string'?boundedText(message.corrected_at,80):null};}
+  catch(_){return fallback;}
+}
+function replaceSegment(next,index,item) {
+  const previous=index>=0?next.segments[index]:null;
+  next.text_units+=segmentUnits(item)-(previous?segmentUnits(previous):0);
+  if(index>=0)next.segments[index]=item;else next.segments.push(item);
 }
 function transcriptInto(next, message, trim) {
   if (!validSegment(message) || !integer(message.revision, 0, Number.MAX_SAFE_INTEGER) ||
       typeof message.text !== 'string' || typeof message.final !== 'boolean') return;
   const key = segmentKey(message.recording_id, message.segment_id);
   const index = next.segments.findIndex(item => item.key === key);
-  const previous = index >= 0 ? next.segments[index] : null;
+  let previous = index >= 0 ? next.segments[index] : null;
+  const edits=correctionFields(message.final?message:{},previous);
+  if(previous&&edits.edit_version>(previous.edit_version||0)){replaceSegment(next,index,Object.assign({},previous,edits));previous=next.segments[index];}
   if (previous && message.revision === previous.revision) {
     // Emotion may finish while this page is hidden. A reconnect snapshot can
     // carry the same text revision with newly completed emotion metadata.
     const emotion=emotionValue(message.emotion);
     if (emotion) next.segments[index]=Object.assign({},previous,{emotion});
+    if(trim!==false)trimHistory(next);
     return;
   }
-  if (previous && (message.revision < previous.revision || (previous.final && !message.final))) return;
+  if (previous && (message.revision < previous.revision || (previous.final && !message.final))) {if(trim!==false)trimHistory(next);return;}
   const item = { key, recording_id: message.recording_id, segment_id: message.segment_id,
     revision: message.revision, text: boundedText(message.text), final: message.final,
     start_ms: Number.isFinite(message.start_ms) ? Math.max(0, message.start_ms) : 0,
     end_ms: Number.isFinite(message.end_ms) ? Math.max(0, message.end_ms) : 0,
-    emotion: emotionValue(message.emotion) || (previous && previous.emotion) || next.pending_emotions[key] || null };
-  next.text_units+=item.text.length-(previous?previous.text.length:0);
-  if (index >= 0) next.segments[index] = item;
-  else next.segments.push(item);
+    emotion: emotionValue(message.emotion) || (previous && previous.emotion) || next.pending_emotions[key] || null,
+    ...edits };
+  replaceSegment(next,index,item);
   delete next.pending_emotions[key];
   if(trim !== false)trimHistory(next);
+}
+function correctionInto(next,message) {
+  if(!validSegment(message))return;
+  const index=next.segments.findIndex(item=>item.key===segmentKey(message.recording_id,message.segment_id));
+  if(index<0||!next.segments[index].final)return;
+  const previous=next.segments[index],edits=correctionFields(message,previous);
+  if(edits.edit_version<=(previous.edit_version||0))return;
+  replaceSegment(next,index,Object.assign({},previous,edits));trimHistory(next);
 }
 function emotionInto(next, message) {
   if (!validSegment(message)) return;
@@ -158,9 +219,9 @@ function emotionInto(next, message) {
 
 function reduce(state, message) {
   if (!object(message) || (message.device_id && message.device_id !== state.device_id)) return state;
-  if(['hello','snapshot','status','transcript','emotion','recording_done','settings_applied'].indexOf(message.type)===-1)return state;
+  if(['hello','snapshot','status','transcript','emotion','history_corrected','recording_done','settings_applied'].indexOf(message.type)===-1)return state;
   const next = Object.assign({}, state);
-  if(['snapshot','transcript','emotion'].indexOf(message.type)!==-1){next.segments=state.segments.slice();next.pending_emotions=Object.assign({},state.pending_emotions);}
+  if(['snapshot','transcript','emotion','history_corrected'].indexOf(message.type)!==-1){next.segments=state.segments.slice();next.pending_emotions=Object.assign({},state.pending_emotions);}
   switch (message.type) {
     case 'hello':
       next.ready = message.ready === true;
@@ -199,6 +260,7 @@ function reduce(state, message) {
       break;
     case 'transcript': transcriptInto(next, message); break;
     case 'emotion': emotionInto(next, message); break;
+    case 'history_corrected': correctionInto(next,message);break;
     case 'recording_done':
       if (safeId(message.recording_id, 64)) {
         next.last_done = { recording_id: message.recording_id,
@@ -214,6 +276,8 @@ function reduce(state, message) {
   if (['hello', 'snapshot', 'settings_applied'].indexOf(message.type) !== -1 && object(message.settings)) {
     try { next.settings = validateSettings(message.settings); next.settings_known = true; } catch (_) { /* Keep last confirmed settings. */ }
   }
+  if(['hello','snapshot'].indexOf(message.type)!==-1)next.capabilities=Array.isArray(message.capabilities)?message.capabilities.slice(0,16).filter(value=>typeof value==='string'&&/^[a-z_]{1,32}$/.test(value)):[];
+  if(message.type==='status'&&message.state==='offline')next.capabilities=[];
   return next;
 }
 
@@ -241,7 +305,7 @@ function groupBuilder() {
         result.push(group);
       }
       group.segments.push(view);
-      group.hasText = group.hasText || Boolean(segment.text);
+      group.hasText = group.hasText || Boolean(displayText(segment));
       group.final = group.final && segment.final;
     });
     result.forEach((group, index) => {
@@ -259,16 +323,30 @@ function groupBuilder() {
   };
 }
 function groups(state) { return groupBuilder()(state); }
-function recordingText(state, id) {
+function recordingText(state, id, source) {
   return state.segments.filter(item => item.recording_id === id)
-    .sort((a, b) => a.segment_id - b.segment_id).map(item => item.text).join('');
+    .sort((a, b) => a.segment_id - b.segment_id).map(item => source==='original'?item.text:displayText(item)).join('');
 }
 function sameViewSegment(a, b) {
   if (a === b) return true;
   const sameEmotion = !a.emotion && !b.emotion || (a.emotion && b.emotion &&
-    a.emotion.label === b.emotion.label && a.emotion.event === b.emotion.event && a.emotion.status === b.emotion.status);
-  return a.key === b.key && a.revision === b.revision && a.text === b.text && a.final === b.final &&
+    a.emotion.label === b.emotion.label && a.emotion.event === b.emotion.event && a.emotion.status === b.emotion.status &&
+    sameQuality(a.emotion.audio_quality,b.emotion.audio_quality) && sameTags(a.emotion.raw_tags,b.emotion.raw_tags) && sameCandidates(a.emotion.candidates,b.emotion.candidates));
+  return a.key === b.key && a.revision === b.revision && a.text === b.text && a.final === b.final && a.edit_version===b.edit_version && a.corrected_text===b.corrected_text && a.corrected_at===b.corrected_at &&
     a.start_ms === b.start_ms && a.end_ms === b.end_ms && a.emotionText === b.emotionText && sameEmotion;
+}
+function sameQuality(a,b) {
+  if(a===b)return true;
+  if(!a||!b)return false;
+  return ['duration_ms','analyzed_ms','peak','rms_dbfs','clipping_ratio','reason'].every(key=>a[key]===b[key]);
+}
+function sameTags(a,b) {
+  if(a===b)return true;
+  return Boolean(a&&b&&a.length===b.length&&a.every((tag,index)=>tag===b[index]));
+}
+function sameCandidates(a,b) {
+  if(a===b)return true;
+  return Boolean(a&&b&&a.length===b.length&&a.every((candidate,index)=>candidate.label===b[index].label&&candidate.score===b[index].score));
 }
 
 function groupPatch(previous, next) {
@@ -289,6 +367,8 @@ function groupPatch(previous, next) {
   return patch;
 }
 
-module.exports = { DEFAULT_SETTINGS, EMOTIONS, STATES, MODES, MAX_SEGMENTS, MAX_TEXT, MAX_TEXT_UNITS,
+return { DEFAULT_SETTINGS, EMOTIONS, STATES, MODES, MAX_SEGMENTS, MAX_TEXT, MAX_TEXT_UNITS,
   validateSettings, normalizeConnection, parsePairing, socketURL, parseMessage,
-  initialState, reduce, groups, groupBuilder, recordingText, groupPatch, boundedText, emotionText };
+  initialState, reduce, groups, groupBuilder, recordingText, groupPatch, boundedText, emotionText,
+  validateCorrection,displayText,segmentKey };
+});

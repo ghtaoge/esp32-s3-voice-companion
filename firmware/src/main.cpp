@@ -193,7 +193,23 @@ void transcriptMessage(JsonObjectConst data, bool fromHistory = false) {
   if (fromHistory) voice::copyUtf8(lastRecordingId, sizeof(lastRecordingId), id);
   const bool restart = fromHistory || segment != lastSegment || (data["final"] | false);
   lastSegment = segment; lastRevision = revision;
-  ui::setText(data["text"] | "", restart);
+  ui::setText(data["text"] | "", restart, epoch);
+}
+void displayHistory(JsonDocument& data) {
+  const char* request = data["request_id"] | "";
+  if (!request[0] || strlen(request) > 64) return;
+  JsonDocument reply; reply["type"] = "display_ack"; reply["request_id"] = request;
+  const char* source = data["source"] | "";
+  const voice::HistorySource kind = !strcmp(source, "original") ? voice::HistorySource::Original :
+    !strcmp(source, "corrected") ? voice::HistorySource::Corrected : voice::HistorySource::None;
+  const JsonString text = data["text"].as<JsonString>();
+  const voice::CaptureControl command = captureSnapshot();
+  if (active || command.gate == voice::CaptureGate::Reserved) reply["error"] = "busy";
+  else if (text.size() > voice::MaxText) reply["error"] = "too_long";
+  else if (kind == voice::HistorySource::None || !data["text"].is<const char*>() || !voice::validDisplayText(text.c_str(), text.size())) reply["error"] = "invalid";
+  else if (!ui::applyHistory(text.c_str(), text.size(), kind, command.generation, captureControl, captureGuard)) reply["error"] = "busy";
+  // No transcript deduplication/session fields and no NVS state are changed.
+  sendJson(reply);
 }
 void onMessage(uint8_t* payload, size_t length) {
   if (length > 8192) { Serial.println("Ignored oversized server JSON"); return; }
@@ -223,6 +239,7 @@ void onMessage(uint8_t* payload, size_t length) {
     if (!pendingPress && !strcmp(id, active ? recordingId : lastRecordingId) && (data["segment_id"] | 0) >= lastSegment)
       ui::setEmotion(data["label"] | "unknown", epoch);
   } else if (!strcmp(type, "settings_set")) applySettings(data);
+  else if (!strcmp(type, "display_set")) displayHistory(data);
   else if (!strcmp(type, "snapshot")) {
     if (!active && captureSnapshot().gate != voice::CaptureGate::Reserved) {
       for (JsonObjectConst item : data["history"].as<JsonArrayConst>()) {
@@ -246,7 +263,8 @@ void onMessage(uint8_t* payload, size_t length) {
 void onSocket(WStype_t type, uint8_t* payload, size_t length) {
   if (type == WStype_CONNECTED) {
     wsConnected = true; serverReady = false;
-    JsonDocument hello; hello["type"] = "hello"; hello["protocol"] = 1; hello["firmware"] = "0.1.0";
+    JsonDocument hello; hello["type"] = "hello"; hello["protocol"] = 1; hello["firmware"] = "0.1.1";
+    hello["capabilities"].to<JsonArray>().add("history_display");
     settingsJson(hello["settings"].to<JsonObject>(), settings); sendJson(hello);
     ui::setPhase(ui::Phase::Processing, "连接本地ASR");
   } else if (type == WStype_DISCONNECTED) {
@@ -438,7 +456,7 @@ void setup() {
       xTaskCreatePinnedToCore(buttonTask, "ptt-button", 3072, nullptr, 3, nullptr, 1) != pdPASS) {
     ui::setPhase(ui::Phase::Error, "音频内存不足"); Serial.println("Audio queue/task allocation failed"); return;
   }
-  Serial.printf("Voice companion 0.1.0: flash=%lu PSRAM=%lu, PCM=16k/16bit mono, button=GPIO%d\n", static_cast<unsigned long>(ESP.getFlashChipSize()), static_cast<unsigned long>(ESP.getPsramSize()), RECORD_BUTTON);
+  Serial.printf("Voice companion 0.1.1: flash=%lu PSRAM=%lu, PCM=16k/16bit mono, button=GPIO%d\n", static_cast<unsigned long>(ESP.getFlashChipSize()), static_cast<unsigned long>(ESP.getPsramSize()), RECORD_BUTTON);
   if (!configured()) { ui::setPhase(ui::Phase::Error, "请配置本地连接"); Serial.println("Copy include/config.example.h to config.local.h and fill local connection settings."); return; }
   WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.setAutoReconnect(true); WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   wifiAttemptAt = millis();

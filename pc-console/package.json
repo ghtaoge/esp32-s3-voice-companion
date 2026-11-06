@@ -1,0 +1,6 @@
+{
+  "name":"esp32-s3-voice-companion-console",
+  "version":"0.1.0",
+  "private":true,
+  "scripts":{"test":"node --test tests/*.test.js"}
+}

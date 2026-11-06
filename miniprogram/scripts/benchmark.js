@@ -5,6 +5,7 @@ const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
 const protocol=require('../utils/protocol');
+const emotionCues=require('../utils/emotion-cues');
 const {Connection}=require('../utils/connection');
 
 class Clock {
@@ -40,7 +41,7 @@ function pageHarness(bridgeDelay=120) {
   }
   const wx={getStorageSync(){},setStorageSync(){},removeStorageSync(){}};
   const sandbox=vm.createContext({Page:value=>{definition=value;},wx,
-    require:name=>name.endsWith('/protocol')?protocol:{Connection:StubConnection},
+    require:name=>name.endsWith('/protocol')?protocol:name.endsWith('/emotion-cues')?emotionCues:{Connection:StubConnection},
     setTimeout:(fn,ms)=>clock.later(fn,ms),clearTimeout:id=>clock.clear(id),console});
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../pages/index/index.js'),'utf8'),sandbox);
   const page=Object.assign({},definition,{data:JSON.parse(JSON.stringify(definition.data)),setData(patch,callback){

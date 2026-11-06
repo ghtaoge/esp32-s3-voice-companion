@@ -8,6 +8,7 @@ constexpr size_t FrameSamples = 320;
 constexpr size_t FrameBytes = FrameSamples * 2;
 constexpr size_t MaxText = 1536;
 constexpr size_t ScreenBytes = 1024;
+enum class HistorySource : uint8_t { None, Original, Corrected };
 
 // A malformed/truncated code point never becomes a partial displayed glyph.
 inline bool nextUtf8(const char* text, size_t length, size_t& offset, uint32_t& cp) {
@@ -40,6 +41,14 @@ inline size_t copyUtf8(char* output, size_t capacity, const char* source) {
   memcpy(output, source, accepted); output[accepted] = 0;
   return accepted;
 }
+// Manual display is an exact operation: reject instead of silently truncating
+// an old sentence. Its byte limit also bounds every copy inside the UI lock.
+inline bool validDisplayText(const char* text, size_t length) {
+  if (!text || !length || length > MaxText) return false;
+  size_t offset = 0; uint32_t cp;
+  while (offset < length) if (!nextUtf8(text, length, offset, cp)) return false;
+  return true;
+}
 inline int16_t pcm16(int32_t sample, unsigned shift) {
   const int32_t value = sample >> shift;
   return static_cast<int16_t>(value > 32767 ? 32767 : value < -32768 ? -32768 : value);
@@ -65,6 +74,12 @@ struct BodyFrameKey {
     return textVersion == other.textVersion && page == other.page && shift == other.shift && scale == other.scale && visible == other.visible;
   }
 };
+inline unsigned textBaseline(unsigned scale, unsigned bodyTop) {
+  // The bundled WQY12 font box has max ascent 11 and descent 2. With a
+  // history badge, a 4x glyph needs all 13 remaining raw pixel rows.
+  const unsigned maximum = (64u - bodyTop) / scale - 2u;
+  return maximum < 13u ? maximum : 13u;
+}
 enum class CaptureGate : uint8_t { Disabled, Armed, Reserved };
 // Callers protect this small command with one critical section. The button
 // task owns press/release; the network task only reads or retires a generation.
@@ -96,6 +111,11 @@ struct CaptureControl {
   }
   void disarm() { if (gate == CaptureGate::Armed) gate = CaptureGate::Disabled; }
 };
+// Recheck this under the same capture lock as press(), immediately at UI
+// commit. An earlier network-side idle snapshot cannot authorize a late write.
+inline bool historyDisplayAllowed(const CaptureControl& capture, bool active, uint32_t expectedGeneration) {
+  return !active && capture.gate != CaptureGate::Reserved && capture.generation == expectedGeneration;
+}
 // Times are uint32 microseconds; signed differences handle timer wrap as long
 // as a recording is shorter than 2^31 us (the configured maximum is 60 s).
 inline SampleSpan clipFrame(uint32_t endedUs, uint32_t samples, uint32_t pressedUs, uint32_t releasedUs) {

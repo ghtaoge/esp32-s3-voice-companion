@@ -16,7 +16,7 @@ from .config import Config
 from .emotion import EmotionService
 from .inference import ASREngine
 from .protocol import DEVICE_ID, RECORDING_ID, MAX_FRAME_BYTES, VAD_FRAME_BYTES, DisplaySettings, error_event, valid_level, validated_settings
-from .storage import HistoryStore
+from .storage import HistoryConflict, HistoryStore
 
 
 log = logging.getLogger("voice_companion")
@@ -73,6 +73,10 @@ class Device:
     history: OrderedDict = field(default_factory=OrderedDict)
     pending_settings: tuple[str, Peer] | None = None
     settings_timer: asyncio.Task | None = None
+    capabilities: set[str] = field(default_factory=set)
+    edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    pending_display: tuple[str, Peer, dict] | None = None
+    display_timer: asyncio.Task | None = None
 
 
 @dataclass
@@ -119,6 +123,8 @@ class Hub:
         for device in self.devices.values():
             if device.settings_timer:
                 device.settings_timer.cancel()
+            if device.display_timer:
+                device.display_timer.cancel()
         for peer in list(self.peers):
             await peer.close()
         await self.emotion.close()
@@ -162,7 +168,7 @@ class Hub:
             history = history[-1:]
         return {"type": "snapshot", "device_id": device.device_id,
                 "state": device.state, "recording_id": device.recording_id,
-                "settings": device.settings, "history": history}
+                "settings": device.settings, "history": history, "capabilities": sorted(device.capabilities)}
 
     async def connect(self, websocket: WebSocket, device_id: str, role: str) -> Peer | None:
         token = websocket.query_params.get("token", "")
@@ -188,10 +194,12 @@ class Hub:
             if old:
                 await self.disconnect(old)
             device.peer = peer
+            device.capabilities.clear()
             device.state = "idle"
             device.recording_id = None
         self.peers.add(peer)
-        peer.send({"type": "hello", "protocol": 1, "device_id": device_id, "ready": self.engine.ready, "settings": device.settings})
+        peer.send({"type": "hello", "protocol": 1, "device_id": device_id, "ready": self.engine.ready,
+                   "settings": device.settings, "capabilities": sorted(device.capabilities)})
         peer.send(self.snapshot(device, role))
         if role == "device":
             self.status(device, "idle", None)
@@ -204,6 +212,7 @@ class Hub:
             if self.active and self.active.peer is peer:
                 await self.abort(self.active, "disconnected", "开发板连接断开，本次录音已结束")
             device.peer = None
+            device.capabilities.clear()
             self.status(device, "offline", None)
             if device.pending_settings:
                 request_id, owner = device.pending_settings
@@ -211,6 +220,12 @@ class Hub:
                 device.pending_settings = None
                 if device.settings_timer:
                     device.settings_timer.cancel()
+            if device.pending_display:
+                request_id, owner, _ = device.pending_display
+                owner.send(error_event("device_offline", "开发板已断开，推送未确认", request_id=request_id))
+                device.pending_display = None
+                if device.display_timer:
+                    device.display_timer.cancel()
         await peer.close()
 
     async def on_json(self, peer: Peer, data: dict) -> None:
@@ -223,6 +238,10 @@ class Hub:
                 peer.send(self.snapshot(device, "client"))
             elif kind == "settings_set":
                 await self.settings_set(peer, device, data)
+            elif kind == "history_correct":
+                await self.history_correct(peer, device, data)
+            elif kind == "history_display":
+                await self.history_display(peer, device, data)
             else:
                 peer.send(error_event("unsupported", "小程序消息类型不支持"))
             return
@@ -232,6 +251,9 @@ class Hub:
             if data.get("protocol") != 1:
                 peer.send(error_event("protocol", "固件协议版本不兼容"))
                 return
+            reported = data.get("capabilities", [])
+            device.capabilities = {"history_display"} if isinstance(reported, list) and "history_display" in reported[:16] else set()
+            self.publish(device.device_id, self.snapshot(device, "client"), clients_only=True)
             if data.get("settings"):
                 try:
                     device.settings = validated_settings(data["settings"])
@@ -261,6 +283,8 @@ class Hub:
                 self.publish(device.device_id, {"type": "level", "recording_id": self.active.recording_id, "level": data["level"]}, clients_only=True)
         elif kind == "settings_ack":
             await self.settings_ack(device, data)
+        elif kind == "display_ack":
+            await self.display_ack(device, data)
         elif kind == "ping":
             peer.send({"type": "pong"})
 
@@ -387,6 +411,9 @@ class Hub:
             return
         if previous and previous.get("emotion"):
             event = {**event, "emotion": previous["emotion"]}
+        if previous and previous.get("edit_version", 0) >= event.get("edit_version", 0):
+            event = {**event, **{name: previous[name] for name in
+                     ("edit_version", "corrected_text", "corrected_at") if name in previous}}
         device.history[key] = dict(event)
         while len(device.history) > self.config.history_limit:
             device.history.popitem(last=False)
@@ -401,10 +428,123 @@ class Hub:
         entry = device.history.get((recording_id, segment_id))
         if not entry:
             return
-        result = {name: result[name] for name in ("label", "event", "status", "raw_tags") if name in result}
+        result = {name: result[name] for name in ("label", "event", "status", "raw_tags", "audio_quality", "candidates") if name in result}
         entry["emotion"] = result
         self.background_io(self.store.upsert, dict(entry))
         self.publish(device_id, {"type": "emotion", "recording_id": recording_id, "segment_id": segment_id, **result})
+
+    def history_entry(self, device: Device, data: dict) -> dict | None:
+        recording_id, segment_id = data.get("recording_id"), data.get("segment_id")
+        if not isinstance(recording_id, str) or not RECORDING_ID.fullmatch(recording_id) or type(segment_id) is not int or not 0 <= segment_id <= 1000000:
+            return None
+        entry = device.history.get((recording_id, segment_id))
+        return entry if entry and entry.get("final") else None
+
+    async def history_correct(self, peer: Peer, device: Device, data: dict) -> None:
+        request_id = data.get("request_id")
+        if not isinstance(request_id, str) or not RECORDING_ID.fullmatch(request_id):
+            peer.send(error_event("request_id", "校对请求标识无效"))
+            return
+        entry = self.history_entry(device, data)
+        expected = data.get("expected_edit_version")
+        text = data.get("text")
+        valid = "text" in data and (text is None or isinstance(text, str))
+        if isinstance(text, str):
+            text = text.strip()
+            try:
+                valid = bool(text) and len(text) <= 512 and len(text.encode("utf-8")) <= 1536 and not any((ord(c) < 32 or 127 <= ord(c) <= 159) and c != "\n" for c in text)
+            except UnicodeError:
+                valid = False
+        if not entry or type(expected) is not int or not 0 <= expected <= 1000000000 or not valid:
+            peer.send(error_event("history_invalid", "只可校对已完成的历史句子，内容须非空且不超过512字和1536字节", request_id=request_id))
+            return
+        async with device.edit_lock:
+            try:
+                updated = await asyncio.to_thread(self.store.correct, dict(entry), expected, text)
+            except HistoryConflict:
+                peer.send(error_event("history_conflict", "这句话已在其他端修改，请保留草稿并重新载入最新版本", request_id=request_id))
+                peer.send(self.snapshot(device, "client"))
+                return
+            except Exception:
+                log.exception("历史校对保存失败")
+                peer.send(error_event("history_save_failed", "校对尚未保存，请重试", request_id=request_id))
+                return
+            fields = {name: updated[name] for name in ("edit_version", "corrected_text", "corrected_at")}
+            current = device.history.get((entry["recording_id"], entry["segment_id"]))
+            if current is not None:
+                current.update(fields)
+            self.publish(device.device_id, {"type": "history_corrected", "request_id": request_id,
+                "recording_id": entry["recording_id"], "segment_id": entry["segment_id"], **fields}, clients_only=True)
+
+    async def history_display(self, peer: Peer, device: Device, data: dict) -> None:
+        request_id = data.get("request_id")
+        if not isinstance(request_id, str) or not RECORDING_ID.fullmatch(request_id):
+            peer.send(error_event("request_id", "推送请求标识无效"))
+            return
+        def fail(code: str, message: str):
+            peer.send(error_event(code, message, request_id=request_id))
+        entry = self.history_entry(device, data)
+        source = data.get("source")
+        if not entry or source not in ("original", "corrected"):
+            fail("history_invalid", "请选择已完成句子的原始或校对版本")
+            return
+        if not device.peer or not device.peer.alive:
+            fail("device_offline", "开发板未连接，内容尚未推送")
+            return
+        if "history_display" not in device.capabilities:
+            fail("display_unsupported", "当前固件不支持历史推送，请更新固件")
+            return
+        if self.active or device.state in ("recording", "processing") or device.pending_display:
+            fail("display_busy", "正在录音、识别或等待上次推送确认，请稍后再试")
+            return
+        version = entry.get("edit_version", 0)
+        if source == "corrected":
+            if type(data.get("expected_edit_version")) is not int or data["expected_edit_version"] != version:
+                fail("history_conflict", "校对版本已更新，请刷新后推送")
+                peer.send(self.snapshot(device, "client"))
+                return
+            text = entry.get("corrected_text")
+        else:
+            text = entry.get("text")
+        try:
+            valid = isinstance(text, str) and bool(text.strip()) and len(text.encode("utf-8")) <= 1536 and not any((ord(c) < 32 or 127 <= ord(c) <= 159) and c != "\n" for c in text)
+        except UnicodeError:
+            valid = False
+        if not valid:
+            fail("display_too_long", "这版内容为空或超过OLED单次1536字节上限，请先校对精简")
+            return
+        # The device acknowledges a unique wire command, so a late ACK cannot
+        # confirm a later push even when a client reuses its own request ID.
+        command = {"type": "display_set", "request_id": secrets.token_hex(12), "recording_id": entry["recording_id"],
+                   "segment_id": entry["segment_id"], "source": source, "edit_version": version, "text": text}
+        device.pending_display = (request_id, peer, command)
+        if not device.peer.send(command):
+            device.pending_display = None
+            fail("device_offline", "开发板发送队列不可用，推送未确认")
+            return
+        peer.send({"type": "display_pending", "request_id": request_id})
+        async def timeout():
+            await asyncio.sleep(self.config.display_timeout_seconds)
+            if device.pending_display and device.pending_display[0] == request_id:
+                device.pending_display = None
+                fail("display_timeout", "开发板未确认，屏幕显示结果未知，请稍后重试")
+        device.display_timer = asyncio.create_task(timeout())
+
+    async def display_ack(self, device: Device, data: dict) -> None:
+        pending = device.pending_display
+        if not pending or data.get("request_id") != pending[2]["request_id"]:
+            return
+        request_id, owner, command = pending
+        device.pending_display = None
+        if device.display_timer:
+            device.display_timer.cancel()
+        if data.get("error"):
+            error = data["error"] if isinstance(data["error"], str) else "invalid"
+            code = {"busy": "display_busy", "too_long": "display_too_long"}.get(error, "display_rejected")
+            owner.send(error_event(code, "开发板未应用推送，请检查录音状态或内容后重试", request_id=request_id))
+            return
+        self.publish(device.device_id, {"type": "history_displayed", "request_id": request_id,
+            **{key: command[key] for key in ("recording_id", "segment_id", "source", "edit_version")}}, clients_only=True)
 
     async def settings_set(self, peer: Peer, device: Device, data: dict) -> None:
         request_id = data.get("request_id")

@@ -20,6 +20,7 @@ jobs:
       - run: python tools/check_public.py
       - run: python -m pytest -q
       - run: npm test --prefix miniprogram
+      - run: node --test pc-console/tests/*.test.js
       - name: Native firmware logic
         run: |
           g++ -std=c++17 -Ifirmware/include firmware/tests/native.cpp -o /tmp/voice-native

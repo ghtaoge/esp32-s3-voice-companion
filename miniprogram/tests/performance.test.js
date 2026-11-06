@@ -68,3 +68,38 @@ test('view completion after hide cannot restart a stale render generation',()=>{
   assert.equal(h.clock.appCount(),0);
   h.page.onUnload();
 });
+
+test('keyword-heavy history bounds highlight nodes and still fits the view payload ceiling',()=>{
+  const h=pageHarness();
+  const rows=Array.from({length:160},(_,n)=>({type:'transcript',recording_id:'r'+n,segment_id:0,revision:1,final:true,
+    text:'我不是不开心，但非常生气。'.repeat(200).slice(0,2048),start_ms:0,end_ms:5000}));
+  h.receive({type:'snapshot',device_id:'s3',state:'idle',settings:p.DEFAULT_SETTINGS,history:rows});h.clock.advance(1000);
+  assert.ok(h.metrics().max_payload_bytes<512*1024);
+  assert.ok(h.page.cueCache.size<=p.MAX_SEGMENTS);
+  h.page.data.groups.forEach(group=>group.segments.forEach(segment=>{
+    assert.ok(segment.cueTokens.filter(token=>token.highlight).length<=16);
+    assert.equal(segment.cueTokens.map(token=>token.text).join(''),segment.text);
+    assert.equal(segment.detailCues.length,0,'closed details must not send the full reason dictionary');
+  }));
+  h.page.onUnload();
+});
+
+test('corrected histories share the original plus correction budget and reuse unchanged lexical views',()=>{
+  const h=pageHarness();
+  const rows=Array.from({length:160},(_,n)=>({type:'transcript',recording_id:'r'+n,segment_id:0,revision:1,final:true,
+    text:'我不是不开心，但非常生气。'.repeat(160).slice(0,2048),edit_version:1,corrected_text:'校对后我非常开心。'.repeat(40),
+    corrected_at:'2026-11-07T00:00:00Z',start_ms:0,end_ms:5000}));
+  const snapshot={type:'snapshot',device_id:'s3',state:'idle',capabilities:['history_display'],history:rows};
+  h.receive(snapshot);h.clock.advance(1000);
+  const before=h.page.cueCache.get('r159:0').analysis,metrics=h.metrics();
+  assert.ok(h.page.state.text_units<=p.MAX_TEXT_UNITS);
+  assert.ok(h.metrics().max_payload_bytes<512*1024);
+  h.page.data.groups.forEach(group=>group.segments.forEach(segment=>{
+    assert.equal(segment.cueTokens.map(token=>token.text).join(''),segment.corrected_text);
+    assert.equal(segment.originalOpen,false);
+  }));
+  h.receive(snapshot);h.clock.advance(1000);
+  assert.equal(h.page.cueCache.get('r159:0').analysis,before);
+  assert.equal(h.metrics().full_history_writes,metrics.full_history_writes);
+  h.page.onUnload();
+});

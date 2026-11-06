@@ -47,13 +47,13 @@ size_t layout(const Snapshot& data, size_t start, bool draw, size_t visibleChara
     int advance = u8g2_GetGlyphWidth(oled.getU8g2(), code);
     if (advance < 1) advance = 6;
     if (x + advance > width) { x = 0; if (++row == rows) return before; }
-    if (draw) oled.drawGlyph(x, row * 16 + 13, code);
+    if (draw) oled.drawGlyph(x, row * 16 + voice::textBaseline(data.settings.scale, bodyTop), code);
     x += advance;
   }
   return offset;
 }
 void paginate(const Snapshot& data) {
-  bodyTop = data.settings.scale >= 3 ? 0 : 16;
+  bodyTop = data.historySource != voice::HistorySource::None ? 12 : data.settings.scale >= 3 ? 0 : 16;
   pages = 1; pageStarts[0] = 0;
   size_t offset = 0;
   const size_t length = strlen(data.text);
@@ -128,8 +128,10 @@ void render(const Snapshot& data, uint32_t now) {
     cachedBodyKey = key; bodyCacheValid = true;
   } else memcpy(oled.getBufferPtr(), bodyCache, voice::ScreenBytes);
   if (bodyTop) {
-    const char* label = data.phase == Phase::Recording ? "录音" : data.phase == Phase::Processing ? "识别" : data.phase == Phase::Offline ? "离线" : data.phase == Phase::Error ? "错误" : "就绪";
-    oled.drawUTF8(0, 12, label);
+    const bool manual = data.historySource != voice::HistorySource::None;
+    const char* label = manual ? (data.historySource == voice::HistorySource::Corrected ? "校对" : "原始") :
+      data.phase == Phase::Recording ? "录音" : data.phase == Phase::Processing ? "识别" : data.phase == Phase::Offline ? "离线" : data.phase == Phase::Error ? "错误" : "就绪";
+    oled.drawUTF8(0, manual ? 10 : 12, label);
     if (data.phase == Phase::Recording) {
       char duration[12]; snprintf(duration, sizeof(duration), "%lus", static_cast<unsigned long>((now - data.startedMs) / 1000));
       oled.drawStr(28, 12, duration);
@@ -140,8 +142,8 @@ void render(const Snapshot& data, uint32_t now) {
     } else if (pages > 1) {
       char count[16]; snprintf(count, sizeof(count), "%u/%u", page + 1, pages); oled.drawStr(31, 12, count);
     }
-    if (data.settings.animation) face(100, 1, data.emotion, now % 4000 < 130, data.phase == Phase::Recording ? level.load() : 0);
-    oled.drawHLine(0, 15, 128);
+    if (data.settings.animation && !manual) face(100, 1, data.emotion, now % 4000 < 130, data.phase == Phase::Recording ? level.load() : 0);
+    oled.drawHLine(0, bodyTop - 1, 128);
   }
   if (!data.text[0]) {
     oled.drawUTF8(0, 35, data.message[0] ? data.message : "按住BOOT说话");
@@ -191,6 +193,7 @@ void beginRecording(uint32_t generation) {
   if (!guard) return;
   xSemaphoreTake(guard, portMAX_DELAY);
   shared.generation = generation; shared.phase = Phase::Recording; shared.startedMs = millis();
+  shared.historySource = voice::HistorySource::None;
   shared.text[0] = 0; ++shared.textVersion; ++shared.resetVersion;
   voice::copyUtf8(shared.message, sizeof(shared.message), "正在录音");
   voice::copyUtf8(shared.emotion, sizeof(shared.emotion), "unknown");
@@ -204,18 +207,39 @@ void setPhase(Phase phase, const char* message, uint32_t expectedGeneration) {
   shared.phase = phase; voice::copyUtf8(shared.message, sizeof(shared.message), message);
   xSemaphoreGive(guard);
 }
-void setText(const char* text, bool restartAnimation) {
+void setText(const char* text, bool restartAnimation, uint32_t expectedGeneration) {
   if (!guard) return;
   xSemaphoreTake(guard, portMAX_DELAY);
+  // beginRecording clears manual mode. Late transcripts/reconnect snapshots
+  // must leave a manually chosen sentence visible until that next press.
+  if (shared.generation != expectedGeneration || shared.historySource != voice::HistorySource::None) { xSemaphoreGive(guard); return; }
+  shared.historySource = voice::HistorySource::None;
   voice::copyUtf8(shared.text, sizeof(shared.text), text);
   ++shared.textVersion;
   if (restartAnimation) ++shared.resetVersion;
   xSemaphoreGive(guard);
 }
+bool applyHistory(const char* text, size_t length, voice::HistorySource source, uint32_t expectedGeneration,
+                  const voice::CaptureControl& capture, portMUX_TYPE& captureGuard) {
+  if (!guard || source == voice::HistorySource::None || !voice::validDisplayText(text, length)) return false;
+  xSemaphoreTake(guard, portMAX_DELAY);
+  // Never wait for a semaphore while holding the capture critical section.
+  // The button publishes Reserved under this lock before taking the UI mutex.
+  portENTER_CRITICAL(&captureGuard);
+  const bool accepted = voice::historyDisplayAllowed(capture, false, expectedGeneration) && shared.generation == expectedGeneration;
+  if (accepted) {
+    memcpy(shared.text, text, length); shared.text[length] = 0;
+    shared.historySource = source; shared.phase = Phase::Idle; shared.message[0] = 0;
+    ++shared.textVersion; ++shared.resetVersion;
+  }
+  portEXIT_CRITICAL(&captureGuard);
+  xSemaphoreGive(guard);
+  return accepted;
+}
 void setEmotion(const char* label, uint32_t expectedGeneration) {
   if (!guard) return;
   xSemaphoreTake(guard, portMAX_DELAY);
-  if (shared.generation == expectedGeneration) voice::copyUtf8(shared.emotion, sizeof(shared.emotion), label);
+  if (shared.generation == expectedGeneration && shared.historySource == voice::HistorySource::None) voice::copyUtf8(shared.emotion, sizeof(shared.emotion), label);
   xSemaphoreGive(guard);
 }
 void setSettings(const voice::Settings& settings) {
